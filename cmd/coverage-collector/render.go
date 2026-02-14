@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,6 +106,7 @@ func runRender(cmd *cobra.Command, args []string) {
 		// Merge coverage and generate HTML reports
 		fmt.Println("🔨 Merging coverage and generating HTML reports...")
 		successCount := 0
+		cachedCount := 0
 		for i := range ownerReports {
 			fmt.Printf("[%d/%d] Processing %s %s/%s (%d pods)...\n",
 				i+1, len(ownerReports),
@@ -116,15 +120,40 @@ func runRender(cmd *cobra.Command, args []string) {
 			}
 
 			if ownerReports[i].MergedCovFile != "" {
+				// Check cache: skip HTML generation if merged coverage hasn't changed
+				htmlFile := ownerHTMLFilename(&ownerReports[i])
+				htmlPath := filepath.Join(renderOutputDir, htmlFile)
+				mergedHash, _ := computeFileMD5(ownerReports[i].MergedCovFile)
+
+				if mergedHash != "" {
+					existingHash := extractHTMLCoverageHash(htmlPath)
+					if existingHash == mergedHash {
+						ownerReports[i].HTMLFile = htmlFile
+						ownerReports[i].HasHTML = true
+						successCount++
+						cachedCount++
+						fmt.Printf("  ✓ Cached: %s\n", htmlFile)
+						continue
+					}
+				}
+
 				if err := generateHTMLForOwner(clusterDir, &ownerReports[i]); err != nil {
 					fmt.Printf("  ⚠️  Warning generating HTML: %v\n", err)
 				} else {
+					// Embed hash in generated HTML for future cache checks
+					if mergedHash != "" {
+						appendCoverageHash(htmlPath, mergedHash)
+					}
 					successCount++
 					fmt.Printf("  ✓ Generated: %s\n", ownerReports[i].HTMLFile)
 				}
 			}
 		}
-		fmt.Printf("\n✅ Generated %d/%d HTML reports\n\n", successCount, len(ownerReports))
+		if cachedCount > 0 {
+			fmt.Printf("\n✅ Generated %d/%d HTML reports (%d cached)\n\n", successCount, len(ownerReports), cachedCount)
+		} else {
+			fmt.Printf("\n✅ Generated %d/%d HTML reports\n\n", successCount, len(ownerReports))
+		}
 	}
 
 	// Generate index.html
@@ -168,8 +197,26 @@ func scanCoverageReports(clusterDir, coverageDir string) ([]CoverageReport, erro
 		}
 
 		if hasCovData {
-			// Always regenerate from binary data so that new covcounters
-			// files added by subsequent collect runs are included.
+			// Collect all covmeta.* and covcounters.* files for hashing
+			var covBinaryFiles []string
+			for _, se := range subEntries {
+				if strings.HasPrefix(se.Name(), "covmeta.") || strings.HasPrefix(se.Name(), "covcounters.") {
+					covBinaryFiles = append(covBinaryFiles, filepath.Join(reportDir, se.Name()))
+				}
+			}
+
+			covdataHashFile := filepath.Join(reportDir, ".covdata.hash")
+			currentHash := computeMultiFileMD5(covBinaryFiles)
+			cachedHash := readHashFile(covdataHashFile)
+
+			// Skip textfmt if binary inputs haven't changed and output exists
+			if currentHash != "" && currentHash == cachedHash {
+				if _, err := os.Stat(coverageFile); err == nil {
+					// coverage_filtered.out exists and inputs unchanged -- skip
+					goto parseReport
+				}
+			}
+
 			cmd := exec.Command("go", "tool", "covdata", "textfmt",
 				"-i="+reportDir,
 				"-o="+rawCoverageFile)
@@ -179,6 +226,10 @@ func scanCoverageReports(clusterDir, coverageDir string) ([]CoverageReport, erro
 			}
 			if err := createFilteredCoverage(rawCoverageFile, coverageFile); err != nil {
 				continue
+			}
+			// Store hash of binary inputs for next run
+			if currentHash != "" {
+				writeHashFile(covdataHashFile, currentHash)
 			}
 		} else if _, err := os.Stat(coverageFile); os.IsNotExist(err) {
 			// No binary data and no filtered file; try generating from
@@ -191,6 +242,7 @@ func scanCoverageReports(clusterDir, coverageDir string) ([]CoverageReport, erro
 			}
 		}
 
+	parseReport:
 		report := CoverageReport{
 			TestName:     entry.Name(),
 			CoverageFile: coverageFile,
@@ -321,7 +373,20 @@ func groupByOwner(reports []CoverageReport) []OwnerReport {
 	ownerMap := make(map[string]*OwnerReport)
 
 	for _, report := range reports {
-		ownerType, ownerName := extractOwnerInfo(report.Pod)
+		var ownerType, ownerName, namespace string
+
+		if report.Namespace == "" {
+			// Host-level process collected via SSH bastion
+			namespace = "host"
+			ownerType = "Host"
+			ownerName = report.BinaryName
+			if ownerName == "" {
+				ownerName = report.Pod
+			}
+		} else {
+			namespace = report.Namespace
+			ownerType, ownerName = extractOwnerInfo(report.Pod)
+		}
 
 		// Prefer binary name over container name for display
 		binaryName := report.BinaryName
@@ -330,7 +395,7 @@ func groupByOwner(reports []CoverageReport) []OwnerReport {
 		}
 
 		// Group by owner + binary name so different binaries get separate rows
-		key := fmt.Sprintf("%s/%s/%s/%s", report.Namespace, ownerType, ownerName, binaryName)
+		key := fmt.Sprintf("%s/%s/%s/%s", namespace, ownerType, ownerName, binaryName)
 
 		if owner, exists := ownerMap[key]; exists {
 			// Deduplicate pod names
@@ -352,7 +417,7 @@ func groupByOwner(reports []CoverageReport) []OwnerReport {
 				containers = []string{binaryName}
 			}
 			ownerMap[key] = &OwnerReport{
-				Namespace:     report.Namespace,
+				Namespace:     namespace,
 				OwnerType:     ownerType,
 				OwnerName:     ownerName,
 				Containers:    containers,
@@ -408,6 +473,26 @@ func mergeCoverageForOwner(clusterDir string, owner *OwnerReport) error {
 	mergedFile := filepath.Join(renderOutputDir,
 		fmt.Sprintf("%s-%s-%s%s-merged.out",
 			owner.Namespace, owner.OwnerType, owner.OwnerName, binaryLabel))
+	mergeHashFile := mergedFile + ".hash"
+
+	// Compute hash of all input coverage files
+	var inputPaths []string
+	for _, report := range owner.SourceReports {
+		inputPaths = append(inputPaths, report.CoverageFile)
+	}
+	inputHash := computeMultiFileMD5(inputPaths)
+
+	// Check cache: skip merge if inputs haven't changed and merged file exists
+	if inputHash != "" && inputHash == readHashFile(mergeHashFile) {
+		if _, err := os.Stat(mergedFile); err == nil {
+			owner.MergedCovFile = mergedFile
+			// Still need to compute stats from existing merged file
+			if err := parseMergedCoverageStats(mergedFile, owner); err == nil {
+				return nil
+			}
+			// If stats parsing fails, fall through and regenerate
+		}
+	}
 
 	// Merge all coverage files
 	coverageMap := make(map[string]CoverageLine)
@@ -458,6 +543,46 @@ func mergeCoverageForOwner(clusterDir string, owner *OwnerReport) error {
 		owner.Coverage = float64(coveredStmts) / float64(totalStmts) * 100
 	}
 
+	// Store hash of inputs for next run
+	if inputHash != "" {
+		writeHashFile(mergeHashFile, inputHash)
+	}
+
+	return nil
+}
+
+// parseMergedCoverageStats reads a merged coverage file and populates owner stats.
+func parseMergedCoverageStats(mergedFile string, owner *OwnerReport) error {
+	data, err := os.ReadFile(mergedFile)
+	if err != nil {
+		return err
+	}
+
+	totalStmts := 0
+	coveredStmts := 0
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "mode:") || line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			continue
+		}
+		var stmtCount, execCount int
+		fmt.Sscanf(parts[1], "%d", &stmtCount)
+		fmt.Sscanf(parts[2], "%d", &execCount)
+		totalStmts += stmtCount
+		if execCount > 0 {
+			coveredStmts += stmtCount
+		}
+	}
+
+	owner.TotalStmts = totalStmts
+	owner.CoveredStmts = coveredStmts
+	if totalStmts > 0 {
+		owner.Coverage = float64(coveredStmts) / float64(totalStmts) * 100
+	}
 	return nil
 }
 
@@ -465,6 +590,119 @@ type CoverageLine struct {
 	Block   string
 	NumStmt int
 	Count   int
+}
+
+// computeFileMD5 returns the hex-encoded MD5 hash of a file's contents.
+func computeFileMD5(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// computeMultiFileMD5 computes a combined MD5 hash over multiple files
+// (sorted by name for consistency). Returns "" on any error.
+func computeMultiFileMD5(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	sorted := make([]string, len(paths))
+	copy(sorted, paths)
+	sort.Strings(sorted)
+
+	h := md5.New()
+	for _, p := range sorted {
+		f, err := os.Open(p)
+		if err != nil {
+			return ""
+		}
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return ""
+		}
+		f.Close()
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// readHashFile reads a stored hash from a sidecar .hash file.
+func readHashFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// writeHashFile writes a hash string to a sidecar .hash file.
+func writeHashFile(path, hash string) {
+	os.WriteFile(path, []byte(hash+"\n"), 0644)
+}
+
+// htmlCacheTag is the prefix used to embed coverage hashes in HTML files.
+const htmlCacheTag = "<!-- coverage-hash: "
+
+// extractHTMLCoverageHash reads the last few bytes of an HTML file looking
+// for a coverage hash comment.
+func extractHTMLCoverageHash(htmlPath string) string {
+	f, err := os.Open(htmlPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	// Seek to the end and read the last 128 bytes which is where the tag lives
+	info, err := f.Stat()
+	if err != nil || info.Size() < 50 {
+		return ""
+	}
+	offset := info.Size() - 128
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, info.Size()-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+		return ""
+	}
+
+	content := string(buf)
+	idx := strings.Index(content, htmlCacheTag)
+	if idx < 0 {
+		return ""
+	}
+	rest := content[idx+len(htmlCacheTag):]
+	endIdx := strings.Index(rest, " -->")
+	if endIdx < 0 {
+		return ""
+	}
+	return rest[:endIdx]
+}
+
+// appendCoverageHash appends the coverage hash tag to an existing HTML file.
+func appendCoverageHash(htmlPath, hash string) {
+	f, err := os.OpenFile(htmlPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "\n%s%s -->\n", htmlCacheTag, hash)
+}
+
+// ownerHTMLFilename returns the expected HTML filename for an owner report.
+func ownerHTMLFilename(owner *OwnerReport) string {
+	htmlBinaryLabel := ""
+	if len(owner.Containers) > 0 {
+		htmlBinaryLabel = "-" + owner.Containers[0]
+	}
+	return fmt.Sprintf("%s-%s-%s%s.html",
+		owner.Namespace, owner.OwnerType, owner.OwnerName, htmlBinaryLabel)
 }
 
 func extractPackagePathFromCoverage(coverageFile string) string {
@@ -1081,7 +1319,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Coverage Report - By Pod Owner</title>
+    <title>Coverage Report - By Owner</title>
     <style>
         * {
             margin: 0;
@@ -1302,6 +1540,8 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         .owner-type.DaemonSet { background: #fff3cd; color: #856404; }
         .owner-type.Job { background: #f8d7da; color: #721c24; }
         .owner-type.Pod { background: #e2e3e5; color: #383d41; }
+        .owner-type.Host { background: #fff3cd; color: #856404; }
+        .namespace.na { background: #fff3cd; color: #856404; }
 
         .pod-count {
             background: #6c757d;
@@ -1433,12 +1673,12 @@ const ownerIndexTemplate = `<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>🎯 Coverage Report - By Pod Owner</h1>
-        <div class="subtitle">Aggregated coverage by Deployment, DaemonSet, StatefulSet, and Job</div>
+        <h1>🎯 Coverage Report - By Owner</h1>
+        <div class="subtitle">Aggregated coverage by Deployment, DaemonSet, StatefulSet, Job, and Host</div>
 
         <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-label">Pod Owners</div>
+                <div class="stat-label">Owners</div>
                 <div class="stat-value">{{.Stats.TotalOwners}}</div>
             </div>
             <div class="stat-card secondary">
@@ -1492,6 +1732,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 <option value="StatefulSet">StatefulSets</option>
                 <option value="Job">Jobs</option>
                 <option value="Pod">Pods</option>
+                <option value="Host">Host</option>
             </select>
             <select id="coverageFilter">
                 <option value="">All Coverage Levels</option>
@@ -1527,7 +1768,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                     data-coverage="{{.Coverage}}"
                     data-statements="{{.TotalStmts}}"
                     data-coverage-class="{{colorClass .Coverage}}">
-                    <td><span class="namespace">{{.Namespace}}</span></td>
+                    <td><span class="namespace{{if eq .Namespace "host"}} na{{end}}">{{.Namespace}}</span></td>
                     <td>
                         <span class="owner-type {{.OwnerType}}">{{.OwnerType}}</span>
                         <strong>{{.OwnerName}}</strong>

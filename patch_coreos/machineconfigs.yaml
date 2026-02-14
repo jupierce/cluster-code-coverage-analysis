@@ -1,0 +1,18 @@
+---
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-osimage-override
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  osImageURL: quay.io/openshift-release-dev/ocp-release-nightly@sha256:2f3fdd51d92dc11dbe94a08ab17c33d87396907935a50e0e962b382217ccd768
+---
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-worker-osimage-override
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  osImageURL: quay.io/openshift-release-dev/ocp-release-nightly@sha256:2f3fdd51d92dc11dbe94a08ab17c33d87396907935a50e0e962b382217ccd768

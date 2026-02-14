@@ -41,7 +41,9 @@ Run the subcommands in this order:
   2. clone-sources Clone the source repositories identified by discovery.
                    Uses the exact commits recorded in the discovery plan.
   3. collect       Connect to every discovered pod and retrieve coverage data.
-  4. render        Merge per-pod coverage by owner, generate HTML reports,
+     scan-nodes   (Optional) Collect coverage from host-level processes
+                   (e.g. kubelet) via hostNetwork DaemonSet proxy.
+  4. render        Merge coverage by owner, generate HTML reports,
                    and build an interactive index.`,
 	}
 
