@@ -87,14 +87,35 @@ func buildFileCoverageReports(coverageFile, repoPath, moduleName string, workspa
 	return reports, nil
 }
 
-// annotateSource produces HTML with line numbers and coverage highlighting spans
+// annotateSource produces HTML with line numbers, coverage highlighting spans,
+// and per-line execution counts.
 func annotateSource(src []byte, profile *cover.Profile) template.HTML {
 	boundaries := profile.Boundaries(src)
+
+	// Pre-compute per-line execution counts from profile blocks.
+	// A line's count is the max count of any block that covers it.
+	// -1 means the line is not tracked by any coverage block.
+	totalLines := 1
+	for _, b := range src {
+		if b == '\n' {
+			totalLines++
+		}
+	}
+	lineCounts := make([]int, totalLines+1) // 1-indexed
+	for i := range lineCounts {
+		lineCounts[i] = -1
+	}
+	for _, block := range profile.Blocks {
+		for line := block.StartLine; line <= block.EndLine && line <= totalLines; line++ {
+			if block.Count > lineCounts[line] {
+				lineCounts[line] = block.Count
+			}
+		}
+	}
 
 	var buf strings.Builder
 	buf.WriteString(`<table class="source-code"><tbody>`)
 
-	// We'll process the source byte by byte, inserting boundaries
 	// Build a map of offset -> list of boundaries at that offset
 	type boundaryEntry struct {
 		b     cover.Boundary
@@ -139,13 +160,12 @@ func annotateSource(src []byte, profile *cover.Profile) template.HTML {
 			if inSpan {
 				buf.WriteString("</span>")
 			}
-			buf.WriteString("</td></tr>\n")
+			// Write execution count column
+			writeExecCount(&buf, lineCounts, lineNum)
+			buf.WriteString("</tr>\n")
 			lineNum++
 			buf.WriteString(fmt.Sprintf(`<tr><td class="line-num" id="L%d">%d</td><td class="line-content">`, lineNum, lineNum))
 			if inSpan {
-				// Re-open the span on the next line
-				// We need to remember what kind of span we were in
-				// Look backwards in the boundaries to find the last opened span
 				buf.WriteString(lastOpenSpan(boundaries, i))
 			}
 		} else if c == '<' {
@@ -164,10 +184,26 @@ func annotateSource(src []byte, profile *cover.Profile) template.HTML {
 	if inSpan {
 		buf.WriteString("</span>")
 	}
-	buf.WriteString("</td></tr>\n")
+	writeExecCount(&buf, lineCounts, lineNum)
+	buf.WriteString("</tr>\n")
 	buf.WriteString("</tbody></table>")
 
 	return template.HTML(buf.String())
+}
+
+// writeExecCount appends the execution count cell for a line.
+func writeExecCount(buf *strings.Builder, lineCounts []int, lineNum int) {
+	buf.WriteString("</td>")
+	if lineNum < len(lineCounts) && lineCounts[lineNum] >= 0 {
+		count := lineCounts[lineNum]
+		if count == 0 {
+			buf.WriteString(`<td class="exec-count exec-zero">0</td>`)
+		} else {
+			buf.WriteString(fmt.Sprintf(`<td class="exec-count exec-hit">%d</td>`, count))
+		}
+	} else {
+		buf.WriteString(`<td class="exec-count"></td>`)
+	}
 }
 
 // lastOpenSpan finds the last opened span tag class at the given source offset
@@ -735,6 +771,9 @@ const customCoverageTemplate = `<!DOCTYPE html>
             background: #fafafa;
             border-right: 1px solid #eee;
             white-space: nowrap;
+            position: sticky;
+            left: 0;
+            z-index: 1;
         }
 
         table.source-code td.line-content {
@@ -744,6 +783,11 @@ const customCoverageTemplate = `<!DOCTYPE html>
 
         table.source-code tr:hover td {
             background: rgba(102, 126, 234, 0.05);
+        }
+
+        table.source-code tr:hover td.line-num,
+        table.source-code tr:hover td.exec-count {
+            background: #f0f2fa;
         }
 
         table.source-code tr:hover td.line-num {
@@ -757,6 +801,30 @@ const customCoverageTemplate = `<!DOCTYPE html>
 
         .cov-none {
             background-color: rgba(220, 53, 69, 0.15);
+        }
+
+        table.source-code td.exec-count {
+            width: 1px;
+            min-width: 40px;
+            padding: 0 8px 0 8px;
+            text-align: right;
+            font-size: 11px;
+            user-select: none;
+            background: #fafafa;
+            border-left: 1px solid #eee;
+            white-space: nowrap;
+            color: #bbb;
+            position: sticky;
+            right: 0;
+            box-shadow: -2px 0 4px rgba(0,0,0,0.05);
+        }
+
+        table.source-code td.exec-hit {
+            color: #28a745;
+        }
+
+        table.source-code td.exec-zero {
+            color: #dc3545;
         }
 
         /* Layout modes */
