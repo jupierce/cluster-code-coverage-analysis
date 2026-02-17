@@ -3,609 +3,483 @@ package main
 import (
 	"bufio"
 	"crypto/md5"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
+	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/spf13/cobra"
+
+	_ "modernc.org/sqlite"
 )
 
 var (
 	renderOutputDir string
-	renderSkipHTML  bool
+	renderSkipComponentHTML  bool
 )
 
-type CoverageReport struct {
-	TestName       string
-	Namespace      string
-	Pod            string
-	Container      string
-	BinaryName     string
-	Image          string
-	CollectedAt    string
-	CoverageFile   string
-	HTMLFile       string
-	Coverage       float64
-	TotalStmts     int
-	CoveredStmts   int
-	SourceRepo     string
-	HasHTML        bool
-	Error          string
-}
-
 type OwnerReport struct {
-	Namespace      string
-	OwnerType      string   // Deployment, DaemonSet, StatefulSet, Job
-	OwnerName      string
-	Containers     []string // unique container names in this owner
-	PodCount       int
-	Pods           []string
-	Coverage       float64
-	TotalStmts     int
-	CoveredStmts   int
-	HTMLFile       string
-	HasHTML        bool
-	MergedCovFile  string
-	SourceReports  []CoverageReport
+	Namespace          string
+	OwnerType          string   // Deployment, DaemonSet, StatefulSet, Job, Host
+	OwnerName          string
+	Containers         []string // unique container/binary names
+	PodCount           int
+	Pods               []string
+	Hosts              []string // unique hostnames
+	Coverage           float64
+	TotalStmts         int
+	CoveredStmts       int
+	HTMLFile           string
+	HasHTML            bool
+	Image              string // image reference from owners table
+	MergedCovFile      string // temp file written from DB for HTML generation
+	MergedCoverageText string // merged coverage text from DB
+	MergeInputHash     string // hash for HTML caching
+	BinaryName         string // binary name from owners table
+	CovmetaHash        string // hash of statement definitions (for deduplication)
+	FirstSeen          string // earliest collected_at timestamp
+	LastSeen           string // latest collected_at timestamp
+	CommitID           string // git commit from image source labels
 }
 
 var renderCmd = &cobra.Command{
 	Use:   "render",
 	Short: "Generate HTML coverage reports and interactive index",
-	Long: `Generate HTML coverage reports for all collected coverage data.
-Aggregates coverage by pod owner (Deployment, DaemonSet, StatefulSet, Job)
-and creates individual HTML reports for each owner with an interactive
-index.html featuring filtering, sorting, and color-coded coverage indicators.`,
-	Run: runRender,
+	Long: `Generate HTML coverage reports from the compiled coverage database.
+
+Reads owner data from the SQLite database (created by 'compile') and generates
+individual HTML reports for each owner with an interactive index.html featuring
+filtering, sorting, and color-coded coverage indicators.
+
+Requires source repositories in <cluster>/repos/ for annotated HTML reports.`,
+	RunE: runRenderE,
 }
 
 func init() {
 	renderCmd.Flags().StringVar(&renderOutputDir, "output-dir", "", "Output directory for HTML reports (default: <cluster>/html)")
-	renderCmd.Flags().BoolVar(&renderSkipHTML, "skip-html", false, "Skip generating individual HTML reports (only create index)")
+	renderCmd.Flags().BoolVar(&renderSkipComponentHTML, "skip-component-html", false, "Skip generating individual component HTML reports (only create index)")
 	clusterCmd.AddCommand(renderCmd)
 }
 
-func runRender(cmd *cobra.Command, args []string) {
+func runRenderE(cmd *cobra.Command, args []string) error {
 	clusterDir := clusterName
 	if renderOutputDir == "" {
 		renderOutputDir = filepath.Join(clusterDir, "html")
 	}
 
-	fmt.Printf("🎨 Rendering coverage reports for cluster: %s\n", clusterName)
-	fmt.Printf("📁 Output directory: %s\n\n", renderOutputDir)
+	fmt.Printf("Rendering coverage reports for cluster: %s\n", clusterName)
+	fmt.Printf("Output directory: %s\n\n", renderOutputDir)
 
 	// Create output directory
 	if err := os.MkdirAll(renderOutputDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	// Scan coverage directory
-	coverageDir := filepath.Join(clusterDir, "coverage")
-	reports, err := scanCoverageReports(clusterDir, coverageDir)
+	// Open SQLite database (read-only)
+	dbPath := filepath.Join(clusterDir, "coverage.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("database not found at %s — run 'compile' first", dbPath)
+	}
+
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error scanning coverage reports: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	// Load owner reports from DB
+	ownerReports, err := loadOwnersForRender(db)
+	if err != nil {
+		return fmt.Errorf("load owners: %w", err)
 	}
 
-	fmt.Printf("Found %d coverage reports\n", len(reports))
+	fmt.Printf("Loaded %d owners from database\n", len(ownerReports))
 
-	// Group by owner
-	ownerReports := groupByOwner(reports)
-	fmt.Printf("Grouped into %d unique pod owners\n\n", len(ownerReports))
+	// Load image sources for fast repo lookup
+	imageSources, err := loadImageSources(db)
+	if err != nil {
+		fmt.Printf("Warning: could not load image sources: %v\n", err)
+		imageSources = make(map[string]imageSource)
+	}
+	fmt.Printf("Loaded %d image source mappings\n\n", len(imageSources))
 
-	if !renderSkipHTML {
-		// Merge coverage and generate HTML reports
-		fmt.Println("🔨 Merging coverage and generating HTML reports...")
-		successCount := 0
-		cachedCount := 0
+	// Enrich owners with commit IDs and covmeta hashes
+	for i := range ownerReports {
+		if ownerReports[i].Image != "" {
+			if src, ok := imageSources[ownerReports[i].Image]; ok {
+				ownerReports[i].CommitID = src.CommitID
+			}
+		}
+		ownerReports[i].CovmetaHash = computeCovmetaHash(ownerReports[i].MergedCoverageText)
+	}
+
+	if !renderSkipComponentHTML {
+		fmt.Printf("Generating HTML reports (concurrency: %d)...\n", maxConcurrency)
+
+		var successCount, cachedCount, skippedCount, errorCount int64
+		var progress atomic.Int64
+
+		// First pass: check cache (fast, serial — just reads last 128 bytes of each file)
+		type genTask struct {
+			index      int
+			mergedHash string
+		}
+		var toGenerate []genTask
+
 		for i := range ownerReports {
-			fmt.Printf("[%d/%d] Processing %s %s/%s (%d pods)...\n",
-				i+1, len(ownerReports),
-				ownerReports[i].OwnerType,
-				ownerReports[i].Namespace,
-				ownerReports[i].OwnerName,
-				ownerReports[i].PodCount)
-
-			if err := mergeCoverageForOwner(clusterDir, &ownerReports[i]); err != nil {
-				fmt.Printf("  ⚠️  Warning merging coverage: %v\n", err)
+			if ownerReports[i].MergedCoverageText == "" {
+				skippedCount++
+				continue
 			}
 
-			if ownerReports[i].MergedCovFile != "" {
-				// Check cache: skip HTML generation if merged coverage hasn't changed
-				htmlFile := ownerHTMLFilename(&ownerReports[i])
-				htmlPath := filepath.Join(renderOutputDir, htmlFile)
-				mergedHash, _ := computeFileMD5(ownerReports[i].MergedCovFile)
+			htmlFile := ownerHTMLFilename(&ownerReports[i])
+			htmlPath := filepath.Join(renderOutputDir, htmlFile)
+			mergedHash := ownerReports[i].MergeInputHash
 
-				if mergedHash != "" {
-					existingHash := extractHTMLCoverageHash(htmlPath)
-					if existingHash == mergedHash {
-						ownerReports[i].HTMLFile = htmlFile
-						ownerReports[i].HasHTML = true
-						successCount++
-						cachedCount++
-						fmt.Printf("  ✓ Cached: %s\n", htmlFile)
-						continue
-					}
+			if mergedHash != "" {
+				existingHash := extractHTMLCoverageHash(htmlPath)
+				if existingHash == mergedHash {
+					ownerReports[i].HTMLFile = htmlFile
+					ownerReports[i].HasHTML = true
+					cachedCount++
+					continue
 				}
+			}
 
-				if err := generateHTMLForOwner(clusterDir, &ownerReports[i]); err != nil {
-					fmt.Printf("  ⚠️  Warning generating HTML: %v\n", err)
+			toGenerate = append(toGenerate, genTask{index: i, mergedHash: mergedHash})
+		}
+
+		total := int64(len(ownerReports))
+		fmt.Printf("  %d cached, %d skipped, %d to generate\n", cachedCount, skippedCount, len(toGenerate))
+
+		// Second pass: generate HTML in parallel
+		sem := make(chan struct{}, maxConcurrency)
+		var wg sync.WaitGroup
+
+		for _, task := range toGenerate {
+			wg.Add(1)
+			go func(t genTask) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				idx := t.index
+				owner := &ownerReports[idx]
+
+				if err := generateHTMLForOwnerFromDB(clusterDir, owner, imageSources); err != nil {
+					n := progress.Add(1)
+					fmt.Printf("[%d/%d] %s/%s: %v\n", n+int64(cachedCount)+int64(skippedCount), total, owner.Namespace, owner.OwnerName, err)
+					atomic.AddInt64(&errorCount, 1)
 				} else {
-					// Embed hash in generated HTML for future cache checks
-					if mergedHash != "" {
-						appendCoverageHash(htmlPath, mergedHash)
+					if t.mergedHash != "" {
+						appendCoverageHash(filepath.Join(renderOutputDir, owner.HTMLFile), t.mergedHash)
 					}
-					successCount++
-					fmt.Printf("  ✓ Generated: %s\n", ownerReports[i].HTMLFile)
+					n := progress.Add(1)
+					atomic.AddInt64(&successCount, 1)
+					fmt.Printf("[%d/%d] Generated: %s\n", n+int64(cachedCount)+int64(skippedCount), total, owner.HTMLFile)
 				}
-			}
+			}(task)
 		}
-		if cachedCount > 0 {
-			fmt.Printf("\n✅ Generated %d/%d HTML reports (%d cached)\n\n", successCount, len(ownerReports), cachedCount)
-		} else {
-			fmt.Printf("\n✅ Generated %d/%d HTML reports\n\n", successCount, len(ownerReports))
-		}
+
+		wg.Wait()
+
+		totalSuccess := successCount + cachedCount
+		fmt.Printf("\nHTML reports: %d generated, %d cached, %d errors, %d skipped (total: %d/%d)\n\n",
+			successCount, cachedCount, errorCount, skippedCount, totalSuccess, total)
 	}
 
 	// Generate index.html
-	fmt.Println("📊 Generating interactive index.html...")
+	fmt.Println("Generating interactive index.html...")
 	if err := generateOwnerIndexHTML(renderOutputDir, ownerReports); err != nil {
-		fmt.Fprintf(os.Stderr, "Error generating index: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("generate index: %w", err)
 	}
 
 	indexPath := filepath.Join(renderOutputDir, "index.html")
-	fmt.Printf("\n✅ Coverage report index generated: %s\n", indexPath)
+	fmt.Printf("\nCoverage report index generated: %s\n", indexPath)
 	fmt.Printf("\nOpen in browser:\n  xdg-open %s\n", indexPath)
-}
-
-func scanCoverageReports(clusterDir, coverageDir string) ([]CoverageReport, error) {
-	var reports []CoverageReport
-
-	entries, err := os.ReadDir(coverageDir)
-	if err != nil {
-		return nil, fmt.Errorf("read coverage directory: %w", err)
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		reportDir := filepath.Join(coverageDir, entry.Name())
-		metadataFile := filepath.Join(reportDir, "metadata.json")
-		coverageFile := filepath.Join(reportDir, "coverage_filtered.out")
-		rawCoverageFile := filepath.Join(reportDir, "coverage.out")
-
-		// Check for covmeta files (raw binary coverage data)
-		hasCovData := false
-		subEntries, _ := os.ReadDir(reportDir)
-		for _, se := range subEntries {
-			if strings.HasPrefix(se.Name(), "covmeta.") {
-				hasCovData = true
-				break
-			}
-		}
-
-		if hasCovData {
-			// Collect all covmeta.* and covcounters.* files for hashing
-			var covBinaryFiles []string
-			for _, se := range subEntries {
-				if strings.HasPrefix(se.Name(), "covmeta.") || strings.HasPrefix(se.Name(), "covcounters.") {
-					covBinaryFiles = append(covBinaryFiles, filepath.Join(reportDir, se.Name()))
-				}
-			}
-
-			covdataHashFile := filepath.Join(reportDir, ".covdata.hash")
-			currentHash := computeMultiFileMD5(covBinaryFiles)
-			cachedHash := readHashFile(covdataHashFile)
-
-			// Skip textfmt if binary inputs haven't changed and output exists
-			if currentHash != "" && currentHash == cachedHash {
-				if _, err := os.Stat(coverageFile); err == nil {
-					// coverage_filtered.out exists and inputs unchanged -- skip
-					goto parseReport
-				}
-			}
-
-			cmd := exec.Command("go", "tool", "covdata", "textfmt",
-				"-i="+reportDir,
-				"-o="+rawCoverageFile)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				fmt.Printf("  ⚠️  Failed to process %s: %v (%s)\n", entry.Name(), err, strings.TrimSpace(string(output)))
-				continue
-			}
-			if err := createFilteredCoverage(rawCoverageFile, coverageFile); err != nil {
-				continue
-			}
-			// Store hash of binary inputs for next run
-			if currentHash != "" {
-				writeHashFile(covdataHashFile, currentHash)
-			}
-		} else if _, err := os.Stat(coverageFile); os.IsNotExist(err) {
-			// No binary data and no filtered file; try generating from
-			// a pre-existing coverage.out text file.
-			if _, err := os.Stat(rawCoverageFile); os.IsNotExist(err) {
-				continue
-			}
-			if err := createFilteredCoverage(rawCoverageFile, coverageFile); err != nil {
-				continue
-			}
-		}
-
-	parseReport:
-		report := CoverageReport{
-			TestName:     entry.Name(),
-			CoverageFile: coverageFile,
-		}
-
-		// Parse metadata if available
-		if data, err := os.ReadFile(metadataFile); err == nil {
-			var metadata struct {
-				PodName     string `json:"pod_name"`
-				Namespace   string `json:"namespace"`
-				Container   struct {
-					Name  string `json:"name"`
-					Image string `json:"image"`
-				} `json:"container"`
-				CollectedAt string `json:"collected_at"`
-				BinaryName  string `json:"binary_name"`
-			}
-			if err := json.Unmarshal(data, &metadata); err == nil {
-				report.Pod = metadata.PodName
-				report.Namespace = metadata.Namespace
-				report.Container = metadata.Container.Name
-				report.Image = metadata.Container.Image
-				report.CollectedAt = metadata.CollectedAt
-				report.BinaryName = metadata.BinaryName
-			}
-		}
-
-		// Parse coverage statistics
-		if err := parseCoverageStats(&report); err == nil {
-			reports = append(reports, report)
-		}
-	}
-
-	return reports, nil
-}
-
-// createFilteredCoverage filters out coverage_server.go lines from a coverage file
-func createFilteredCoverage(inputFile, outputFile string) error {
-	data, err := os.ReadFile(inputFile)
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(data), "\n")
-	var filtered []string
-	for _, line := range lines {
-		if !strings.Contains(line, "coverage_server.go") {
-			filtered = append(filtered, line)
-		}
-	}
-
-	return os.WriteFile(outputFile, []byte(strings.Join(filtered, "\n")), 0644)
-}
-
-func parseCoverageStats(report *CoverageReport) error {
-	data, err := os.ReadFile(report.CoverageFile)
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(data), "\n")
-	covered := 0
-	total := 0
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, "mode:") || line == "" {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			continue
-		}
-
-		var stmtCount, execCount int
-		fmt.Sscanf(parts[1], "%d", &stmtCount)
-		fmt.Sscanf(parts[2], "%d", &execCount)
-
-		total += stmtCount
-		if execCount > 0 {
-			covered += stmtCount
-		}
-	}
-
-	if total > 0 {
-		report.Coverage = float64(covered) / float64(total) * 100
-		report.TotalStmts = total
-		report.CoveredStmts = covered
-	}
-
 	return nil
 }
 
-func extractOwnerInfo(podName string) (ownerType, ownerName string) {
-	// Pattern matching for different pod types
-	// Deployment: name-<replicaset-hash>-<pod-hash>
-	// StatefulSet: name-<ordinal>
-	// DaemonSet: name-<pod-hash>
-	// Job: name-<job-hash>
-
-	// StatefulSet pattern: ends with -<number>
-	if match := regexp.MustCompile(`^(.+)-(\d+)$`).FindStringSubmatch(podName); match != nil {
-		return "StatefulSet", match[1]
+// loadOwnersForRender queries the owners table and returns OwnerReport structs.
+func loadOwnersForRender(db *sql.DB) ([]OwnerReport, error) {
+	rows, err := db.Query(`
+		SELECT group_key, namespace, owner_type, owner_name, binary_name,
+			image, pods_json, pod_count, containers_json, hosts_json,
+			total_stmts, covered_stmts, coverage_pct,
+			merged_coverage_text, merge_input_hash,
+			first_seen, last_seen
+		FROM owners
+		ORDER BY namespace, owner_type, owner_name, binary_name, first_seen
+	`)
+	if err != nil {
+		return nil, err
 	}
+	defer rows.Close()
 
-	// Deployment/ReplicaSet pattern: name-<hash>-<hash>
-	if match := regexp.MustCompile(`^(.+)-([a-z0-9]{8,10})-([a-z0-9]{5})$`).FindStringSubmatch(podName); match != nil {
-		return "Deployment", match[1]
-	}
-
-	// Job pattern: name-<hash> (completed jobs)
-	if strings.Contains(podName, "installer-") || strings.Contains(podName, "pruner-") {
-		if match := regexp.MustCompile(`^(.+-\d+)-[a-z0-9]+$`).FindStringSubmatch(podName); match != nil {
-			return "Job", match[1]
-		}
-	}
-
-	// DaemonSet pattern: name-<5-char-hash>
-	if match := regexp.MustCompile(`^(.+)-([a-z0-9]{5})$`).FindStringSubmatch(podName); match != nil {
-		return "DaemonSet", match[1]
-	}
-
-	// Default: treat as standalone pod
-	return "Pod", podName
-}
-
-func groupByOwner(reports []CoverageReport) []OwnerReport {
-	ownerMap := make(map[string]*OwnerReport)
-
-	for _, report := range reports {
-		var ownerType, ownerName, namespace string
-
-		if report.Namespace == "" {
-			// Host-level process collected via SSH bastion
-			namespace = "host"
-			ownerType = "Host"
-			ownerName = report.BinaryName
-			if ownerName == "" {
-				ownerName = report.Pod
-			}
-		} else {
-			namespace = report.Namespace
-			ownerType, ownerName = extractOwnerInfo(report.Pod)
-		}
-
-		// Prefer binary name over container name for display
-		binaryName := report.BinaryName
-		if binaryName == "" {
-			binaryName = report.Container
-		}
-
-		// Group by owner + binary name so different binaries get separate rows
-		key := fmt.Sprintf("%s/%s/%s/%s", namespace, ownerType, ownerName, binaryName)
-
-		if owner, exists := ownerMap[key]; exists {
-			// Deduplicate pod names
-			podSeen := false
-			for _, p := range owner.Pods {
-				if p == report.Pod {
-					podSeen = true
-					break
-				}
-			}
-			if !podSeen {
-				owner.Pods = append(owner.Pods, report.Pod)
-				owner.PodCount++
-			}
-			owner.SourceReports = append(owner.SourceReports, report)
-		} else {
-			containers := []string{}
-			if binaryName != "" {
-				containers = []string{binaryName}
-			}
-			ownerMap[key] = &OwnerReport{
-				Namespace:     namespace,
-				OwnerType:     ownerType,
-				OwnerName:     ownerName,
-				Containers:    containers,
-				PodCount:      1,
-				Pods:          []string{report.Pod},
-				SourceReports: []CoverageReport{report},
-			}
-		}
-	}
-
-	// Convert map to slice and sort
 	var owners []OwnerReport
-	for _, owner := range ownerMap {
-		sort.Strings(owner.Containers)
-		owners = append(owners, *owner)
+	for rows.Next() {
+		var (
+			groupKey       string
+			o              OwnerReport
+			binaryName     string
+			podsJSON       string
+			containersJSON string
+			hostsJSON      string
+		)
+		if err := rows.Scan(&groupKey, &o.Namespace, &o.OwnerType, &o.OwnerName,
+			&binaryName, &o.Image, &podsJSON, &o.PodCount, &containersJSON, &hostsJSON,
+			&o.TotalStmts, &o.CoveredStmts, &o.Coverage,
+			&o.MergedCoverageText, &o.MergeInputHash,
+			&o.FirstSeen, &o.LastSeen); err != nil {
+			return nil, err
+		}
+
+		o.BinaryName = binaryName
+		json.Unmarshal([]byte(podsJSON), &o.Pods)
+		json.Unmarshal([]byte(containersJSON), &o.Containers)
+		json.Unmarshal([]byte(hostsJSON), &o.Hosts)
+
+		if o.Pods == nil {
+			o.Pods = []string{}
+		}
+		if o.Containers == nil {
+			o.Containers = []string{}
+		}
+		if o.Hosts == nil {
+			o.Hosts = []string{}
+		}
+
+		owners = append(owners, o)
 	}
 
-	sort.Slice(owners, func(i, j int) bool {
-		if owners[i].Namespace != owners[j].Namespace {
-			return owners[i].Namespace < owners[j].Namespace
-		}
-		if owners[i].OwnerType != owners[j].OwnerType {
-			return owners[i].OwnerType < owners[j].OwnerType
-		}
-		if owners[i].OwnerName != owners[j].OwnerName {
-			return owners[i].OwnerName < owners[j].OwnerName
-		}
-		// Sort by binary name within the same owner
-		ci := ""
-		cj := ""
-		if len(owners[i].Containers) > 0 {
-			ci = owners[i].Containers[0]
-		}
-		if len(owners[j].Containers) > 0 {
-			cj = owners[j].Containers[0]
-		}
-		return ci < cj
-	})
-
-	return owners
+	return owners, rows.Err()
 }
 
-func mergeCoverageForOwner(clusterDir string, owner *OwnerReport) error {
-	if len(owner.SourceReports) == 0 {
-		return fmt.Errorf("no source reports")
+// generateHTMLForOwnerFromDB writes the merged coverage text from DB to a temp file,
+// then runs the existing HTML generation pipeline.
+func generateHTMLForOwnerFromDB(clusterDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
+	// Write merged coverage text to temp file
+	tmpFile, err := os.CreateTemp("", "coverage-merged-*.out")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.WriteString(owner.MergedCoverageText); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	owner.MergedCovFile = tmpPath
+
+	return generateHTMLForOwner(clusterDir, owner, imageSources)
+}
+
+// generateHTMLForOwner generates an HTML coverage report for an owner.
+// It expects owner.MergedCovFile to be set to a file containing the merged coverage text.
+func generateHTMLForOwner(clusterDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
+	reposDir := filepath.Join(clusterDir, "repos")
+	var repoPath string
+
+	// Extract package path from coverage (needed for path rewriting regardless of repo lookup strategy)
+	packagePath := ""
+	if owner.MergedCovFile != "" {
+		packagePath = extractPackagePathFromCoverage(owner.MergedCovFile)
 	}
 
-	// Create merged coverage file - include binary name if available
-	binaryLabel := ""
-	if len(owner.Containers) > 0 {
-		binaryLabel = "-" + owner.Containers[0]
-	}
-	mergedFile := filepath.Join(renderOutputDir,
-		fmt.Sprintf("%s-%s-%s%s-merged.out",
-			owner.Namespace, owner.OwnerType, owner.OwnerName, binaryLabel))
-	mergeHashFile := mergedFile + ".hash"
-
-	// Compute hash of all input coverage files
-	var inputPaths []string
-	for _, report := range owner.SourceReports {
-		inputPaths = append(inputPaths, report.CoverageFile)
-	}
-	inputHash := computeMultiFileMD5(inputPaths)
-
-	// Check cache: skip merge if inputs haven't changed and merged file exists
-	if inputHash != "" && inputHash == readHashFile(mergeHashFile) {
-		if _, err := os.Stat(mergedFile); err == nil {
-			owner.MergedCovFile = mergedFile
-			// Still need to compute stats from existing merged file
-			if err := parseMergedCoverageStats(mergedFile, owner); err == nil {
-				return nil
+	// Strategy 1: Find repo via image source labels (fast, O(1))
+	if owner.Image != "" {
+		if src, ok := imageSources[owner.Image]; ok {
+			repoPath = findRepoByImageSource(reposDir, src)
+			if repoPath != "" {
+				fmt.Printf("  Found repo via image labels: %s\n", src.SourceRepo)
 			}
-			// If stats parsing fails, fall through and regenerate
 		}
 	}
 
-	// Merge all coverage files
-	coverageMap := make(map[string]CoverageLine)
-	var mode string
+	// Strategy 2: Find repo via package path matching (slower, walks repos/)
+	if repoPath == "" && packagePath != "" {
+		repoPath = findMatchingRepository(reposDir, packagePath)
+	}
 
-	for _, report := range owner.SourceReports {
-		if err := mergeCoverageFile(report.CoverageFile, coverageMap, &mode); err != nil {
-			return fmt.Errorf("merge %s: %w", report.CoverageFile, err)
+	// Strategy 3: Fallback by owner name (slowest, walks repos/)
+	if repoPath == "" {
+		repoPath = findRepoByOwnerName(reposDir, owner.OwnerName)
+	}
+
+	if repoPath == "" {
+		return fmt.Errorf("no source repository found for package path")
+	}
+
+	moduleName := getModuleName(repoPath)
+	covFileToUse := owner.MergedCovFile
+
+	// Check if coverage file needs path rewriting
+	needsRewrite := false
+	rewriteOldPath := packagePath
+
+	if moduleName != "" && packagePath != "" && !strings.HasPrefix(packagePath, moduleName) {
+		needsRewrite = true
+	}
+
+	// Handle /workspace/ paths
+	if !needsRewrite {
+		if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
+			content := string(data)
+			if strings.Contains(content, "/workspace/") && moduleName != "" {
+				needsRewrite = true
+				rewriteOldPath = "/workspace/"
+			}
 		}
 	}
 
-	// Write merged coverage
-	f, err := os.Create(mergedFile)
+	// Handle /go/src/ prefixed paths
+	if !needsRewrite {
+		if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
+			if strings.Contains(string(data), "/go/src/") {
+				needsRewrite = true
+				if moduleName != "" {
+					rewriteOldPath = "/go/src/" + moduleName
+				}
+			}
+		}
+	}
+
+	if needsRewrite {
+		rewrittenFile, err := rewriteCoveragePaths(covFileToUse, rewriteOldPath, moduleName)
+		if err == nil {
+			covFileToUse = rewrittenFile
+			defer os.Remove(rewrittenFile)
+		}
+	}
+
+	// Filter out coverage lines for source files that don't exist in the repo
+	if filteredFile, wasFiltered := filterMissingSourceFiles(covFileToUse, repoPath); wasFiltered {
+		if covFileToUse != owner.MergedCovFile {
+			os.Remove(covFileToUse)
+		}
+		covFileToUse = filteredFile
+		defer os.Remove(filteredFile)
+	}
+
+	// Generate custom HTML report
+	htmlFile := ownerHTMLFilename(owner)
+
+	absOutputDir, err := filepath.Abs(renderOutputDir)
 	if err != nil {
-		return fmt.Errorf("create merged file: %w", err)
-	}
-	defer f.Close()
-
-	if mode == "" {
-		mode = "set"
-	}
-	fmt.Fprintf(f, "mode: %s\n", mode)
-
-	// Sort keys for consistent output
-	var keys []string
-	for key := range coverageMap {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	totalStmts := 0
-	coveredStmts := 0
-
-	for _, key := range keys {
-		line := coverageMap[key]
-		fmt.Fprintf(f, "%s %d %d\n", line.Block, line.NumStmt, line.Count)
-
-		totalStmts += line.NumStmt
-		if line.Count > 0 {
-			coveredStmts += line.NumStmt
-		}
+		return fmt.Errorf("get absolute output dir: %w", err)
 	}
 
-	owner.MergedCovFile = mergedFile
-	owner.TotalStmts = totalStmts
-	owner.CoveredStmts = coveredStmts
-	if totalStmts > 0 {
-		owner.Coverage = float64(coveredStmts) / float64(totalStmts) * 100
+	absOutputPath := filepath.Join(absOutputDir, htmlFile)
+
+	fileReports, err := buildFileCoverageReports(covFileToUse, repoPath, moduleName)
+	if err != nil {
+		return fmt.Errorf("build file coverage reports: %w", err)
 	}
 
-	// Store hash of inputs for next run
-	if inputHash != "" {
-		writeHashFile(mergeHashFile, inputHash)
+	if err := renderCustomCoverageHTML(absOutputPath, owner, fileReports); err != nil {
+		return fmt.Errorf("render custom HTML: %w", err)
 	}
+
+	owner.HTMLFile = htmlFile
+	owner.HasHTML = true
 
 	return nil
 }
 
-// parseMergedCoverageStats reads a merged coverage file and populates owner stats.
-func parseMergedCoverageStats(mergedFile string, owner *OwnerReport) error {
-	data, err := os.ReadFile(mergedFile)
+// ---------------------------------------------------------------------------
+// Image source helpers
+// ---------------------------------------------------------------------------
+
+type imageSource struct {
+	SourceRepo string
+	CommitID   string
+}
+
+// loadImageSources loads the image→source mapping from the database.
+func loadImageSources(db *sql.DB) (map[string]imageSource, error) {
+	rows, err := db.Query("SELECT image, source_repo, commit_id FROM image_sources WHERE error_msg = '' AND source_repo != ''")
 	if err != nil {
-		return err
+		return nil, err
+	}
+	defer rows.Close()
+
+	sources := make(map[string]imageSource)
+	for rows.Next() {
+		var img, repo, commit string
+		if err := rows.Scan(&img, &repo, &commit); err != nil {
+			return nil, err
+		}
+		sources[img] = imageSource{SourceRepo: repo, CommitID: commit}
+	}
+	return sources, rows.Err()
+}
+
+// findRepoByImageSource looks up a repo directory using the source repo URL
+// and commit ID from image labels. This is O(1) — no directory walking.
+func findRepoByImageSource(reposDir string, src imageSource) string {
+	if src.SourceRepo == "" {
+		return ""
 	}
 
-	totalStmts := 0
-	coveredStmts := 0
+	u, err := url.Parse(src.SourceRepo)
+	if err != nil || u.Host == "" {
+		return ""
+	}
 
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "mode:") || line == "" {
+	repoPath := filepath.Join(reposDir, u.Host, strings.TrimPrefix(u.Path, "/"))
+
+	// Check if go.mod exists directly in repo path
+	if _, err := os.Stat(filepath.Join(repoPath, "go.mod")); err == nil {
+		return repoPath
+	}
+
+	// Check subdirectories (e.g., commit hash dirs from clone-sources)
+	entries, err := os.ReadDir(repoPath)
+	if err != nil {
+		return ""
+	}
+
+	commitPrefix := ""
+	if len(src.CommitID) >= 8 {
+		commitPrefix = src.CommitID[:8]
+	}
+
+	var fallback string
+	for _, e := range entries {
+		if !e.IsDir() {
 			continue
 		}
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
+		subPath := filepath.Join(repoPath, e.Name())
+		if _, err := os.Stat(filepath.Join(subPath, "go.mod")); err != nil {
 			continue
 		}
-		var stmtCount, execCount int
-		fmt.Sscanf(parts[1], "%d", &stmtCount)
-		fmt.Sscanf(parts[2], "%d", &execCount)
-		totalStmts += stmtCount
-		if execCount > 0 {
-			coveredStmts += stmtCount
+		// Prefer commit-matching directory
+		if commitPrefix != "" && strings.HasPrefix(e.Name(), commitPrefix) {
+			return subPath
+		}
+		if fallback == "" {
+			fallback = subPath
 		}
 	}
 
-	owner.TotalStmts = totalStmts
-	owner.CoveredStmts = coveredStmts
-	if totalStmts > 0 {
-		owner.Coverage = float64(coveredStmts) / float64(totalStmts) * 100
-	}
-	return nil
+	return fallback
 }
 
-type CoverageLine struct {
-	Block   string
-	NumStmt int
-	Count   int
-}
-
-// computeFileMD5 returns the hex-encoded MD5 hash of a file's contents.
-func computeFileMD5(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := md5.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
+// ---------------------------------------------------------------------------
+// Hash / cache helpers
+// ---------------------------------------------------------------------------
 
 // computeMultiFileMD5 computes a combined MD5 hash over multiple files
 // (sorted by name for consistency). Returns "" on any error.
@@ -632,20 +506,6 @@ func computeMultiFileMD5(paths []string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// readHashFile reads a stored hash from a sidecar .hash file.
-func readHashFile(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// writeHashFile writes a hash string to a sidecar .hash file.
-func writeHashFile(path, hash string) {
-	os.WriteFile(path, []byte(hash+"\n"), 0644)
-}
-
 // htmlCacheTag is the prefix used to embed coverage hashes in HTML files.
 const htmlCacheTag = "<!-- coverage-hash: "
 
@@ -658,7 +518,6 @@ func extractHTMLCoverageHash(htmlPath string) string {
 	}
 	defer f.Close()
 
-	// Seek to the end and read the last 128 bytes which is where the tag lives
 	info, err := f.Stat()
 	if err != nil || info.Size() < 50 {
 		return ""
@@ -695,15 +554,52 @@ func appendCoverageHash(htmlPath, hash string) {
 	fmt.Fprintf(f, "\n%s%s -->\n", htmlCacheTag, hash)
 }
 
+// computeCovmetaHash computes a hash of the statement definitions in coverage text,
+// ignoring execution counts. Owners with the same hash measure the same set of statements.
+func computeCovmetaHash(coverageText string) string {
+	if coverageText == "" {
+		return ""
+	}
+	var stmtLines []string
+	for _, line := range strings.Split(coverageText, "\n") {
+		if strings.HasPrefix(line, "mode:") || line == "" {
+			continue
+		}
+		// Strip the execution count (last space-separated field)
+		if lastSpace := strings.LastIndex(line, " "); lastSpace > 0 {
+			stmtLines = append(stmtLines, line[:lastSpace])
+		}
+	}
+	sort.Strings(stmtLines)
+	h := md5.New()
+	for _, s := range stmtLines {
+		io.WriteString(h, s)
+		io.WriteString(h, "\n")
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // ownerHTMLFilename returns the expected HTML filename for an owner report.
 func ownerHTMLFilename(owner *OwnerReport) string {
 	htmlBinaryLabel := ""
 	if len(owner.Containers) > 0 {
 		htmlBinaryLabel = "-" + owner.Containers[0]
 	}
-	return fmt.Sprintf("%s-%s-%s%s.html",
-		owner.Namespace, owner.OwnerType, owner.OwnerName, htmlBinaryLabel)
+	commitSuffix := ""
+	if owner.CommitID != "" {
+		short := owner.CommitID
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		commitSuffix = "-" + short
+	}
+	return fmt.Sprintf("%s-%s-%s%s%s.html",
+		owner.Namespace, owner.OwnerType, owner.OwnerName, htmlBinaryLabel, commitSuffix)
 }
+
+// ---------------------------------------------------------------------------
+// Source repository helpers
+// ---------------------------------------------------------------------------
 
 func extractPackagePathFromCoverage(coverageFile string) string {
 	f, err := os.Open(coverageFile)
@@ -719,28 +615,22 @@ func extractPackagePathFromCoverage(coverageFile string) string {
 			continue
 		}
 
-		// Parse package path from coverage line
-		// Format: package/path/file.go:line.col,line.col statements count
 		parts := strings.Fields(line)
 		if len(parts) > 0 {
 			fileAndLine := parts[0]
 			if idx := strings.Index(fileAndLine, ":"); idx > 0 {
 				filePath := fileAndLine[:idx]
 
-				// Skip non-module paths (container build paths like /workspace/)
-				// and keep scanning for a proper Go module path
 				if strings.HasPrefix(filePath, "/") && !strings.Contains(filePath, "/src/github.com/") {
 					continue
 				}
 
-				// Handle container build paths like /go/src/github.com/...
 				if strings.Contains(filePath, "/src/github.com/") {
 					if idx := strings.Index(filePath, "/src/"); idx >= 0 {
-						filePath = filePath[idx+5:] // Skip "/src/"
+						filePath = filePath[idx+5:]
 					}
 				}
 
-				// Remove filename to get package path
 				if lastSlash := strings.LastIndex(filePath, "/"); lastSlash > 0 {
 					return filePath[:lastSlash]
 				}
@@ -750,8 +640,6 @@ func extractPackagePathFromCoverage(coverageFile string) string {
 	return ""
 }
 
-// findMatchingRepository finds a repository that matches the given package path
-// Handles package path migrations, forks, and organization changes
 func findMatchingRepository(reposDir, packagePath string) string {
 	type repoCandidate struct {
 		path       string
@@ -761,15 +649,12 @@ func findMatchingRepository(reposDir, packagePath string) string {
 
 	var candidates []repoCandidate
 
-	// Extract repository name from package path for fuzzy matching
-	// e.g., "github.com/coreos/prometheus-operator" -> "prometheus-operator"
 	packageParts := strings.Split(packagePath, "/")
 	var packageRepoName string
 	if len(packageParts) >= 3 {
-		packageRepoName = packageParts[2] // The repo name part
+		packageRepoName = packageParts[2]
 	}
 
-	// Walk all repositories and score them
 	filepath.Walk(reposDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || !info.IsDir() {
 			return nil
@@ -780,7 +665,6 @@ func findMatchingRepository(reposDir, packagePath string) string {
 			return nil
 		}
 
-		// Read module name from go.mod
 		data, err := os.ReadFile(goMod)
 		if err != nil {
 			return nil
@@ -793,13 +677,10 @@ func findMatchingRepository(reposDir, packagePath string) string {
 
 				score := 0
 
-				// Exact match (highest priority)
 				if strings.HasPrefix(packagePath, moduleName) {
 					score = 100
 				}
 
-				// Repository name match (handles org changes)
-				// e.g., "github.com/coreos/prometheus-operator" matches "github.com/prometheus-operator/prometheus-operator"
 				if packageRepoName != "" {
 					moduleParts := strings.Split(moduleName, "/")
 					if len(moduleParts) >= 2 {
@@ -812,8 +693,6 @@ func findMatchingRepository(reposDir, packagePath string) string {
 					}
 				}
 
-				// Special case: prometheus-operator package path migrations
-				// coreos/prometheus-operator -> prometheus-operator/prometheus-operator
 				if strings.Contains(packagePath, "coreos/prometheus-operator") &&
 					strings.Contains(moduleName, "prometheus-operator/prometheus-operator") {
 					score = 90
@@ -837,12 +716,10 @@ func findMatchingRepository(reposDir, packagePath string) string {
 		return nil
 	})
 
-	// Return the best match
 	if len(candidates) == 0 {
 		return ""
 	}
 
-	// Sort by score (descending)
 	bestCandidate := candidates[0]
 	for _, c := range candidates {
 		if c.score > bestCandidate.score {
@@ -853,57 +730,6 @@ func findMatchingRepository(reposDir, packagePath string) string {
 	return bestCandidate.path
 }
 
-func mergeCoverageFile(filename string, coverageMap map[string]CoverageLine, mode *string) error {
-	f, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if strings.HasPrefix(line, "mode:") {
-			if *mode == "" {
-				*mode = strings.TrimPrefix(line, "mode: ")
-			}
-			continue
-		}
-
-		if line == "" {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			continue
-		}
-
-		block := parts[0]
-		var numStmt, count int
-		fmt.Sscanf(parts[1], "%d", &numStmt)
-		fmt.Sscanf(parts[2], "%d", &count)
-
-		if existing, exists := coverageMap[block]; exists {
-			// Merge: take max count
-			if count > existing.Count {
-				existing.Count = count
-				coverageMap[block] = existing
-			}
-		} else {
-			coverageMap[block] = CoverageLine{
-				Block:   block,
-				NumStmt: numStmt,
-				Count:   count,
-			}
-		}
-	}
-
-	return scanner.Err()
-}
-
-// getModuleName reads the module name from a repository's go.mod file
 func getModuleName(repoPath string) string {
 	goMod := filepath.Join(repoPath, "go.mod")
 	data, err := os.ReadFile(goMod)
@@ -920,25 +746,17 @@ func getModuleName(repoPath string) string {
 	return ""
 }
 
-// extractModulePrefix extracts the module-level prefix from a package path
-// e.g., "github.com/coreos/prometheus-operator/cmd/reloader" -> "github.com/coreos/prometheus-operator"
 func extractModulePrefix(packagePath string) string {
 	parts := strings.Split(packagePath, "/")
-	// For github.com paths, the module is the first 3 segments: github.com/org/repo
 	if len(parts) >= 3 && parts[0] == "github.com" {
 		return strings.Join(parts[:3], "/")
 	}
-	// For other paths (k8s.io, golang.org, etc.), use first 2 segments
 	if len(parts) >= 2 {
 		return strings.Join(parts[:2], "/")
 	}
 	return packagePath
 }
 
-// rewriteCoveragePaths creates a new coverage file with rewritten package paths
-// This handles cases where the coverage file references old package paths (e.g., github.com/coreos/prometheus-operator)
-// but the actual module uses a different path (e.g., github.com/prometheus-operator/prometheus-operator)
-// It also handles container build paths like /workspace/ or /go/src/
 func rewriteCoveragePaths(coverageFile, oldPath, newPath string) (string, error) {
 	data, err := os.ReadFile(coverageFile)
 	if err != nil {
@@ -947,14 +765,10 @@ func rewriteCoveragePaths(coverageFile, oldPath, newPath string) (string, error)
 
 	content := string(data)
 
-	// For /workspace/ paths, replace directly (not a module path)
 	if oldPath == "/workspace/" {
 		content = strings.ReplaceAll(content, "/workspace/", newPath+"/")
 	} else {
-		// Extract just the module-level prefix from the old path
 		oldModulePrefix := extractModulePrefix(oldPath)
-
-		// Replace the module prefix, preserving sub-package paths
 		content = strings.ReplaceAll(content, "/go/src/"+oldModulePrefix, newPath)
 		content = strings.ReplaceAll(content, oldModulePrefix, newPath)
 	}
@@ -973,8 +787,6 @@ func rewriteCoveragePaths(coverageFile, oldPath, newPath string) (string, error)
 	return tmpFile.Name(), nil
 }
 
-// filterMissingSourceFiles creates a new coverage file with lines removed for source files
-// that don't exist in the repository (e.g., generated files like bindata.go)
 func filterMissingSourceFiles(coverageFile, repoPath string) (string, bool) {
 	data, err := os.ReadFile(coverageFile)
 	if err != nil {
@@ -992,7 +804,6 @@ func filterMissingSourceFiles(coverageFile, repoPath string) (string, bool) {
 			continue
 		}
 
-		// Extract file path from coverage line
 		parts := strings.Fields(line)
 		if len(parts) < 1 {
 			filtered = append(filtered, line)
@@ -1008,7 +819,6 @@ func filterMissingSourceFiles(coverageFile, repoPath string) (string, bool) {
 
 		filePath := fileAndLine[:idx]
 
-		// Convert module path to filesystem path relative to repo
 		relPath := filePath
 		if moduleName != "" && strings.HasPrefix(filePath, moduleName) {
 			relPath = strings.TrimPrefix(filePath, moduleName)
@@ -1044,9 +854,6 @@ func filterMissingSourceFiles(coverageFile, repoPath string) (string, bool) {
 	return tmpFile.Name(), true
 }
 
-// findRepoByOwnerName tries to find a repository by matching the owner name
-// to repository directory names. This handles cases like /workspace/ paths
-// where the coverage file has no Go module path information.
 func findRepoByOwnerName(reposDir, ownerName string) string {
 	var bestMatch string
 	bestScore := 0
@@ -1061,16 +868,13 @@ func findRepoByOwnerName(reposDir, ownerName string) string {
 			return nil
 		}
 
-		// Get the repo directory name (last component before the commit hash dir)
 		dirParts := strings.Split(path, "/")
 		if len(dirParts) < 2 {
 			return nil
 		}
 
-		// The repo name is the parent of the commit hash directory
 		repoName := dirParts[len(dirParts)-2]
 
-		// Score the match
 		score := 0
 		ownerLower := strings.ToLower(ownerName)
 		repoLower := strings.ToLower(repoName)
@@ -1078,7 +882,6 @@ func findRepoByOwnerName(reposDir, ownerName string) string {
 		if ownerLower == repoLower {
 			score = 100
 		} else if strings.Contains(repoLower, ownerLower) || strings.Contains(ownerLower, repoLower) {
-			// Partial match - use length of overlap as score
 			score = 30
 		}
 
@@ -1093,115 +896,9 @@ func findRepoByOwnerName(reposDir, ownerName string) string {
 	return bestMatch
 }
 
-func generateHTMLForOwner(clusterDir string, owner *OwnerReport) error {
-	// Find source repository by analyzing coverage file
-	reposDir := filepath.Join(clusterDir, "repos")
-	var repoPath string
-
-	// Read coverage file to find package path
-	packagePath := ""
-	if owner.MergedCovFile != "" {
-		packagePath = extractPackagePathFromCoverage(owner.MergedCovFile)
-		if packagePath != "" {
-			repoPath = findMatchingRepository(reposDir, packagePath)
-		}
-	}
-
-	// Fallback: try to match by owner name when package path matching fails
-	// This handles /workspace/ paths and other non-standard coverage formats
-	if repoPath == "" {
-		repoPath = findRepoByOwnerName(reposDir, owner.OwnerName)
-	}
-
-	if repoPath == "" {
-		return fmt.Errorf("no source repository found for package path")
-	}
-
-	// Read module name from repository's go.mod
-	moduleName := getModuleName(repoPath)
-
-	covFileToUse := owner.MergedCovFile
-
-	// Check if coverage file needs path rewriting
-	needsRewrite := false
-	rewriteOldPath := packagePath
-
-	if moduleName != "" && packagePath != "" && !strings.HasPrefix(packagePath, moduleName) {
-		needsRewrite = true
-	}
-
-	// Handle /workspace/ paths: rewrite to the module name
-	if !needsRewrite {
-		if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
-			content := string(data)
-			if strings.Contains(content, "/workspace/") && moduleName != "" {
-				needsRewrite = true
-				rewriteOldPath = "/workspace/"
-			}
-		}
-	}
-
-	if !needsRewrite {
-		// Also rewrite if coverage file contains /go/src/ prefixed paths (container build artifact)
-		if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
-			if strings.Contains(string(data), "/go/src/") {
-				needsRewrite = true
-				// When module name matches but paths have /go/src/ prefix,
-				// rewrite /go/src/<module> to <module>
-				if moduleName != "" {
-					rewriteOldPath = "/go/src/" + moduleName
-				}
-			}
-		}
-	}
-
-	if needsRewrite {
-		rewrittenFile, err := rewriteCoveragePaths(covFileToUse, rewriteOldPath, moduleName)
-		if err == nil {
-			covFileToUse = rewrittenFile
-			defer os.Remove(rewrittenFile)
-		}
-	}
-
-	// Filter out coverage lines for source files that don't exist in the repo
-	// (e.g., generated files like bindata.go)
-	if filteredFile, wasFiltered := filterMissingSourceFiles(covFileToUse, repoPath); wasFiltered {
-		if covFileToUse != owner.MergedCovFile {
-			os.Remove(covFileToUse) // Clean up previous temp file
-		}
-		covFileToUse = filteredFile
-		defer os.Remove(filteredFile)
-	}
-
-	// Generate custom HTML report
-	htmlBinaryLabel := ""
-	if len(owner.Containers) > 0 {
-		htmlBinaryLabel = "-" + owner.Containers[0]
-	}
-	htmlFile := fmt.Sprintf("%s-%s-%s%s.html",
-		owner.Namespace, owner.OwnerType, owner.OwnerName, htmlBinaryLabel)
-
-	absOutputDir, err := filepath.Abs(renderOutputDir)
-	if err != nil {
-		return fmt.Errorf("get absolute output dir: %w", err)
-	}
-
-	absOutputPath := filepath.Join(absOutputDir, htmlFile)
-
-	fileReports, err := buildFileCoverageReports(covFileToUse, repoPath, moduleName)
-	if err != nil {
-		return fmt.Errorf("build file coverage reports: %w", err)
-	}
-
-	if err := renderCustomCoverageHTML(absOutputPath, owner, fileReports); err != nil {
-		return fmt.Errorf("render custom HTML: %w", err)
-	}
-
-	owner.HTMLFile = htmlFile
-	owner.HasHTML = true
-
-	return nil
-}
+// ---------------------------------------------------------------------------
+// Index HTML generation
+// ---------------------------------------------------------------------------
 
 func generateOwnerIndexHTML(outputDir string, owners []OwnerReport) error {
 	indexPath := filepath.Join(outputDir, "index.html")
@@ -1227,6 +924,19 @@ func generateOwnerIndexHTML(outputDir string, owners []OwnerReport) error {
 		},
 		"joinContainers": func(containers []string) string {
 			return strings.Join(containers, ", ")
+		},
+		"containerBinary": func(containers []string, binaryName string) string {
+			c := strings.Join(containers, ", ")
+			if c == "" {
+				return binaryName
+			}
+			return c + " / " + binaryName
+		},
+		"shortCommit": func(commitID string) string {
+			if len(commitID) > 8 {
+				return commitID[:8]
+			}
+			return commitID
 		},
 		"formatInt": func(n int) string {
 			s := fmt.Sprintf("%d", n)
@@ -1335,7 +1045,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         }
 
         .container {
-            max-width: 1600px;
+            max-width: 98vw;
             margin: 0 auto;
             background: white;
             padding: 30px;
@@ -1543,17 +1253,6 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         .owner-type.Host { background: #fff3cd; color: #856404; }
         .namespace.na { background: #fff3cd; color: #856404; }
 
-        .pod-count {
-            background: #6c757d;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 11px;
-            font-weight: 600;
-            display: inline-block;
-            margin-left: 8px;
-        }
-
         .coverage-bar {
             display: flex;
             align-items: center;
@@ -1616,6 +1315,35 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             word-break: break-word;
         }
 
+        .commit-hash {
+            color: #888;
+            font-size: 11px;
+            font-weight: normal;
+        }
+
+        .container-cell {
+            position: relative;
+        }
+
+        .container-cell .tooltip {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            background: #333;
+            color: #fff;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: nowrap;
+            z-index: 100;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+
+        .container-cell:hover .tooltip {
+            display: block;
+        }
+
         .no-html {
             color: #999;
             font-style: italic;
@@ -1640,6 +1368,74 @@ const ownerIndexTemplate = `<!DOCTYPE html>
 
         .filter-info.active {
             display: block;
+        }
+
+        .checkbox-filters {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .checkbox-filters label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: #555;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .checkbox-filters input[type="checkbox"] {
+            cursor: pointer;
+        }
+
+        .owner-row {
+            cursor: pointer;
+        }
+
+        .owner-row:hover {
+            background-color: #e8f0fe;
+        }
+
+        .owner-row.expanded {
+            background-color: #e8f0fe;
+        }
+
+        .details-row td {
+            padding: 0 !important;
+            border-top: none !important;
+        }
+
+        .details-content {
+            padding: 8px 16px 12px 32px;
+            background: #f8f9fa;
+            border-bottom: 2px solid #e0e0e0;
+        }
+
+        .details-table {
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        .details-table td {
+            padding: 3px 12px 3px 0;
+            border: none;
+        }
+
+        .details-label {
+            color: #666;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .details-value code {
+            background: #e8e8e8;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 12px;
+            word-break: break-all;
         }
 
         @media (max-width: 768px) {
@@ -1673,54 +1469,50 @@ const ownerIndexTemplate = `<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>🎯 Coverage Report - By Owner</h1>
+        <h1>Coverage Report - By Owner</h1>
         <div class="subtitle">Aggregated coverage by Deployment, DaemonSet, StatefulSet, Job, and Host</div>
 
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-label">Owners</div>
-                <div class="stat-value">{{.Stats.TotalOwners}}</div>
+                <div class="stat-value" id="statOwners">{{.Stats.TotalOwners}}</div>
             </div>
             <div class="stat-card secondary">
                 <div class="stat-label">Overall Coverage</div>
-                <div class="stat-value">{{formatPct .Stats.OverallCoverage}}</div>
+                <div class="stat-value" id="statCoverage">{{formatPct .Stats.OverallCoverage}}</div>
             </div>
             <div class="stat-card tertiary">
-                <div class="stat-label">Total Statements</div>
-                <div class="stat-value">{{formatInt .Stats.TotalStmts}}</div>
-            </div>
-            <div class="stat-card quaternary">
-                <div class="stat-label">Total Pods</div>
-                <div class="stat-value">{{.Stats.TotalPods}}</div>
+                <div class="stat-label">Unique Statements</div>
+                <div class="stat-value" id="statStmts">—</div>
             </div>
         </div>
 
         <div class="coverage-distribution">
             <div class="coverage-badge badge-excellent">
                 <span>Excellent (≥70%)</span>
-                <span class="count">{{.Stats.Excellent}}</span>
+                <span class="count" id="badgeExcellent">{{.Stats.Excellent}}</span>
             </div>
             <div class="coverage-badge badge-good">
                 <span>Good (50-69%)</span>
-                <span class="count">{{.Stats.Good}}</span>
+                <span class="count" id="badgeGood">{{.Stats.Good}}</span>
             </div>
             <div class="coverage-badge badge-moderate">
                 <span>Moderate (30-49%)</span>
-                <span class="count">{{.Stats.Moderate}}</span>
+                <span class="count" id="badgeModerate">{{.Stats.Moderate}}</span>
             </div>
             <div class="coverage-badge badge-poor">
                 <span>Poor (15-29%)</span>
-                <span class="count">{{.Stats.Poor}}</span>
+                <span class="count" id="badgePoor">{{.Stats.Poor}}</span>
             </div>
             <div class="coverage-badge badge-critical">
                 <span>Critical (<15%)</span>
-                <span class="count">{{.Stats.Critical}}</span>
+                <span class="count" id="badgeCritical">{{.Stats.Critical}}</span>
             </div>
         </div>
 
         <div class="controls">
             <div class="search-box">
-                <input type="text" id="searchBox" placeholder="🔍 Search namespace or owner name...">
+                <input type="text" id="searchBox" placeholder="Search namespace or owner name...">
             </div>
             <select id="namespaceFilter">
                 <option value="">All Namespaces</option>
@@ -1744,6 +1536,11 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             </select>
         </div>
 
+        <div class="checkbox-filters">
+            <label><input type="checkbox" id="hideTestBinaries" checked> Hide openshift-tests entries</label>
+            <label><input type="checkbox" id="hideE2eNamespaces" checked> Hide e2e-* namespace entries</label>
+        </div>
+
         <div id="filterInfo" class="filter-info"></div>
 
         <table id="ownersTable">
@@ -1751,8 +1548,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 <tr>
                     <th class="sortable" data-sort="namespace">Namespace</th>
                     <th class="sortable" data-sort="owner">Owner</th>
-                    <th class="sortable" data-sort="container">Container</th>
-                    <th class="sortable" data-sort="pods">Pods</th>
+                    <th class="sortable" data-sort="container">Container / Binary</th>
                     <th class="sortable" data-sort="coverage">Coverage</th>
                     <th class="sortable" data-sort="statements">Statements</th>
                     <th>Report</th>
@@ -1764,17 +1560,26 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                     data-owner="{{.OwnerName}}"
                     data-owner-type="{{.OwnerType}}"
                     data-container="{{joinContainers .Containers}}"
+                    data-binary="{{.BinaryName}}"
                     data-pods="{{.PodCount}}"
                     data-coverage="{{.Coverage}}"
                     data-statements="{{.TotalStmts}}"
-                    data-coverage-class="{{colorClass .Coverage}}">
-                    <td><span class="namespace{{if eq .Namespace "host"}} na{{end}}">{{.Namespace}}</span></td>
+                    data-covered-stmts="{{.CoveredStmts}}"
+                    data-image="{{.Image}}"
+                    data-covmeta-hash="{{.CovmetaHash}}"
+                    data-coverage-class="{{colorClass .Coverage}}"
+                    data-first-seen="{{.FirstSeen}}"
+                    class="owner-row">
+                    <td>{{if ne .OwnerType "Host"}}<span class="namespace{{if eq .Namespace "host"}} na{{end}}">{{.Namespace}}</span>{{end}}</td>
                     <td>
                         <span class="owner-type {{.OwnerType}}">{{.OwnerType}}</span>
-                        <strong>{{.OwnerName}}</strong>
+                        {{if ne .OwnerType "Host"}}<strong>{{.OwnerName}}</strong>{{end}}
                     </td>
-                    <td><code class="containers">{{joinContainers .Containers}}</code></td>
-                    <td><span class="pod-count">{{.PodCount}} pod{{if ne .PodCount 1}}s{{end}}</span></td>
+                    <td class="container-cell">
+                        {{if eq .OwnerType "Host"}}<code class="containers">/ {{.BinaryName}}</code>
+                        {{else}}<code class="containers">{{containerBinary .Containers .BinaryName}}{{if .CommitID}} <span class="commit-hash">({{shortCommit .CommitID}})</span>{{end}}</code>
+                        {{if or .FirstSeen .LastSeen}}<div class="tooltip">{{if .FirstSeen}}First seen: {{.FirstSeen}}{{end}}{{if and .FirstSeen .LastSeen}}<br>{{end}}{{if .LastSeen}}Last seen: {{.LastSeen}}{{end}}</div>{{end}}{{end}}
+                    </td>
                     <td>
                         <div class="coverage-bar">
                             <div class="bar-container">
@@ -1788,10 +1593,21 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                     <td class="statements">{{.CoveredStmts}}/{{.TotalStmts}}</td>
                     <td>
                         {{if .HasHTML}}
-                        <a href="{{.HTMLFile}}" target="_blank">📊 View HTML</a>
+                        <a href="{{.HTMLFile}}" target="_blank">View HTML</a>
                         {{else}}
                         <span class="no-html">No HTML</span>
                         {{end}}
+                    </td>
+                </tr>
+                <tr class="details-row" style="display:none">
+                    <td colspan="6">
+                        <div class="details-content">
+                            <table class="details-table">
+                                {{if .Image}}<tr><td class="details-label">Image</td><td class="details-value"><code>{{.Image}}</code></td></tr>{{end}}
+                                {{if .CovmetaHash}}<tr><td class="details-label">Binary Hash</td><td class="details-value"><code>{{.CovmetaHash}}</code></td></tr>{{end}}
+                                {{if .Hosts}}<tr><td class="details-label">Hosts</td><td class="details-value">{{joinContainers .Hosts}}</td></tr>{{end}}
+                            </table>
+                        </div>
                     </td>
                 </tr>
                 {{end}}
@@ -1817,32 +1633,88 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         const searchBox = document.getElementById('searchBox');
         const ownerTypeFilter = document.getElementById('ownerTypeFilter');
         const coverageFilter = document.getElementById('coverageFilter');
+        const hideTestBinaries = document.getElementById('hideTestBinaries');
+        const hideE2eNamespaces = document.getElementById('hideE2eNamespaces');
         const filterInfo = document.getElementById('filterInfo');
         const table = document.getElementById('ownersTable');
-        const rows = table.querySelectorAll('tbody tr');
+        const rows = table.querySelectorAll('tbody tr.owner-row');
+
+        function covClass(pct) {
+            if (pct >= 70) return 'excellent';
+            if (pct >= 50) return 'good';
+            if (pct >= 30) return 'moderate';
+            if (pct >= 15) return 'poor';
+            return 'critical';
+        }
+
+        function updateStats() {
+            let owners = 0, totalStmts = 0, coveredStmts = 0;
+            let excellent = 0, good = 0, moderate = 0, poor = 0, critical = 0;
+            const seenHashes = new Set();
+            let uniqueStmts = 0;
+
+            rows.forEach(row => {
+                if (row.style.display === 'none') return;
+                owners++;
+                totalStmts += parseInt(row.dataset.statements) || 0;
+                coveredStmts += parseInt(row.dataset.coveredStmts) || 0;
+
+                // Deduplicate total statements by covmeta hash
+                const hash = row.dataset.covmetaHash;
+                if (hash && !seenHashes.has(hash)) {
+                    seenHashes.add(hash);
+                    uniqueStmts += parseInt(row.dataset.statements) || 0;
+                } else if (!hash) {
+                    uniqueStmts += parseInt(row.dataset.statements) || 0;
+                }
+
+                const cls = row.dataset.coverageClass;
+                if (cls === 'excellent') excellent++;
+                else if (cls === 'good') good++;
+                else if (cls === 'moderate') moderate++;
+                else if (cls === 'poor') poor++;
+                else critical++;
+            });
+
+            const pct = totalStmts > 0 ? (coveredStmts / totalStmts * 100) : 0;
+            document.getElementById('statOwners').textContent = owners.toLocaleString();
+            document.getElementById('statCoverage').textContent = pct.toFixed(1) + '%';
+            document.getElementById('statStmts').textContent = uniqueStmts.toLocaleString();
+            document.getElementById('badgeExcellent').textContent = excellent;
+            document.getElementById('badgeGood').textContent = good;
+            document.getElementById('badgeModerate').textContent = moderate;
+            document.getElementById('badgePoor').textContent = poor;
+            document.getElementById('badgeCritical').textContent = critical;
+        }
 
         function applyFilters() {
             const searchTerm = searchBox.value.toLowerCase();
             const selectedNamespace = namespaceFilter.value;
             const selectedOwnerType = ownerTypeFilter.value;
             const selectedCoverage = coverageFilter.value;
+            const hideTests = hideTestBinaries.checked;
+            const hideE2e = hideE2eNamespaces.checked;
 
             let visibleCount = 0;
+            let anyFilter = searchTerm || selectedNamespace || selectedOwnerType || selectedCoverage || hideTests || hideE2e;
 
             rows.forEach(row => {
-                const namespace = row.dataset.namespace.toLowerCase();
+                const namespace = row.dataset.namespace;
+                const namespaceLower = namespace.toLowerCase();
                 const owner = row.dataset.owner.toLowerCase();
                 const container = row.dataset.container.toLowerCase();
+                const binary = row.dataset.binary.toLowerCase();
                 const ownerType = row.dataset.ownerType;
                 const coverageClass = row.dataset.coverageClass;
 
                 const matchesSearch = !searchTerm ||
-                    namespace.includes(searchTerm) ||
+                    namespaceLower.includes(searchTerm) ||
                     owner.includes(searchTerm) ||
-                    container.includes(searchTerm);
+                    container.includes(searchTerm) ||
+                    binary.includes(searchTerm);
 
                 const matchesNamespace = !selectedNamespace ||
-                    row.dataset.namespace === selectedNamespace;
+                    namespace === selectedNamespace;
 
                 const matchesOwnerType = !selectedOwnerType ||
                     ownerType === selectedOwnerType;
@@ -1850,27 +1722,53 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 const matchesCoverage = !selectedCoverage ||
                     coverageClass === selectedCoverage;
 
-                if (matchesSearch && matchesNamespace && matchesOwnerType && matchesCoverage) {
+                const matchesTestFilter = !hideTests ||
+                    binary !== 'openshift-tests';
+
+                const matchesE2eFilter = !hideE2e ||
+                    !namespace.startsWith('e2e-');
+
+                if (matchesSearch && matchesNamespace && matchesOwnerType && matchesCoverage && matchesTestFilter && matchesE2eFilter) {
                     row.style.display = '';
                     visibleCount++;
                 } else {
                     row.style.display = 'none';
+                    // Collapse details row when owner is filtered out
+                    if (row._detailsRow) {
+                        row._detailsRow.style.display = 'none';
+                        row.classList.remove('expanded');
+                    }
                 }
             });
 
             // Update filter info
-            if (searchTerm || selectedNamespace || selectedOwnerType || selectedCoverage) {
+            if (anyFilter) {
                 filterInfo.classList.add('active');
                 filterInfo.textContent = 'Showing ' + visibleCount + ' of ' + rows.length + ' owners';
             } else {
                 filterInfo.classList.remove('active');
             }
+
+            updateStats();
         }
 
         searchBox.addEventListener('input', applyFilters);
         namespaceFilter.addEventListener('change', applyFilters);
         ownerTypeFilter.addEventListener('change', applyFilters);
         coverageFilter.addEventListener('change', applyFilters);
+        hideTestBinaries.addEventListener('change', applyFilters);
+        hideE2eNamespaces.addEventListener('change', applyFilters);
+
+        // Cache each owner row's details row reference
+        rows.forEach(row => {
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains('details-row')) {
+                row._detailsRow = next;
+            }
+        });
+
+        // Apply default filters on page load
+        applyFilters();
 
         // Sorting functionality
         let currentSort = { column: null, direction: 'asc' };
@@ -1902,7 +1800,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             rowsArray.sort((a, b) => {
                 let aVal, bVal;
 
-                if (column === 'coverage' || column === 'statements' || column === 'pods') {
+                if (column === 'coverage' || column === 'statements') {
                     aVal = parseFloat(a.dataset[column]);
                     bVal = parseFloat(b.dataset[column]);
                 } else if (column === 'owner') {
@@ -1918,11 +1816,33 @@ const ownerIndexTemplate = `<!DOCTYPE html>
 
                 if (aVal < bVal) return direction === 'asc' ? -1 : 1;
                 if (aVal > bVal) return direction === 'asc' ? 1 : -1;
+                // Tiebreaker: sort by first_seen ascending
+                const aFS = a.dataset.firstSeen || '';
+                const bFS = b.dataset.firstSeen || '';
+                if (aFS < bFS) return -1;
+                if (aFS > bFS) return 1;
                 return 0;
             });
 
-            rowsArray.forEach(row => tbody.appendChild(row));
+            rowsArray.forEach(row => {
+                const detailsRow = row._detailsRow;
+                tbody.appendChild(row);
+                if (detailsRow) tbody.appendChild(detailsRow);
+            });
         }
+
+
+        // Row expand/collapse
+        document.querySelectorAll('.owner-row').forEach(row => {
+            row.addEventListener('click', (e) => {
+                // Don't toggle if clicking a link
+                if (e.target.tagName === 'A') return;
+                const detailsRow = row.nextElementSibling;
+                if (!detailsRow || !detailsRow.classList.contains('details-row')) return;
+                const isExpanded = row.classList.toggle('expanded');
+                detailsRow.style.display = isExpanded ? '' : 'none';
+            });
+        });
 
         // Format numbers
         document.querySelectorAll('.stat-value').forEach(el => {
