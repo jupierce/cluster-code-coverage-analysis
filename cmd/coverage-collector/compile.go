@@ -687,6 +687,81 @@ func inspectImages(db *sql.DB) error {
 		sourceRepo := info.Config.Config.Labels["io.openshift.build.source-location"]
 		commitID := info.Config.Config.Labels["io.openshift.build.commit.id"]
 
+		// If no source labels found, try two fallback strategies:
+
+		// Fallback 1: The image may be a manifest list. Retry with
+		// --filter-by-os to get the architecture-specific manifest.
+		if sourceRepo == "" {
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+			cmd2 := exec.CommandContext(ctx2, "oc", "image", "info", imageRef, "--filter-by-os=linux/amd64", "-o", "json")
+			output2, err2 := cmd2.CombinedOutput()
+			cancel2()
+
+			if err2 == nil {
+				var info2 struct {
+					Config struct {
+						Config struct {
+							Labels map[string]string `json:"Labels"`
+						} `json:"config"`
+					} `json:"config"`
+				}
+				if json.Unmarshal(output2, &info2) == nil {
+					if repo := info2.Config.Config.Labels["io.openshift.build.source-location"]; repo != "" {
+						sourceRepo = repo
+						commitID = info2.Config.Config.Labels["io.openshift.build.commit.id"]
+						fmt.Printf("  Resolved manifest list via linux/amd64 filter\n")
+					}
+				}
+			}
+		}
+
+		// Fallback 2: The image may be a release payload. Look up which
+		// owners use this image and resolve via 'oc adm release info --image-for'.
+		if sourceRepo == "" && info.Config.Config.Labels["io.openshift.release"] != "" {
+			componentNames := findOwnersForImage(db, img)
+			for _, component := range componentNames {
+				ctx3, cancel3 := context.WithTimeout(context.Background(), 30*time.Second)
+				cmd3 := exec.CommandContext(ctx3, "oc", "adm", "release", "info", imageRef, "--image-for="+component)
+				output3, err3 := cmd3.CombinedOutput()
+				cancel3()
+
+				if err3 != nil {
+					continue
+				}
+
+				componentImage := strings.TrimSpace(string(output3))
+				if componentImage == "" {
+					continue
+				}
+
+				// Inspect the resolved component image
+				ctx4, cancel4 := context.WithTimeout(context.Background(), 30*time.Second)
+				cmd4 := exec.CommandContext(ctx4, "oc", "image", "info", componentImage, "--filter-by-os=linux/amd64", "-o", "json")
+				output4, err4 := cmd4.CombinedOutput()
+				cancel4()
+
+				if err4 != nil {
+					continue
+				}
+
+				var info4 struct {
+					Config struct {
+						Config struct {
+							Labels map[string]string `json:"Labels"`
+						} `json:"config"`
+					} `json:"config"`
+				}
+				if json.Unmarshal(output4, &info4) == nil {
+					if repo := info4.Config.Config.Labels["io.openshift.build.source-location"]; repo != "" {
+						sourceRepo = repo
+						commitID = info4.Config.Config.Labels["io.openshift.build.commit.id"]
+						fmt.Printf("  Resolved release payload component %q → %s\n", component, truncateImageRef(componentImage))
+						break
+					}
+				}
+			}
+		}
+
 		db.Exec(`
 			INSERT INTO image_sources (image, source_repo, commit_id, inspected_at, error_msg)
 			VALUES (?, ?, ?, datetime('now'), '')
@@ -709,6 +784,24 @@ func inspectImages(db *sql.DB) error {
 
 	fmt.Printf("  Inspected: %d, Errors: %d\n", inspectedCount, errorCount)
 	return nil
+}
+
+// findOwnersForImage returns the distinct owner_name values for owners
+// that use the given image. Used to resolve release payload components.
+func findOwnersForImage(db *sql.DB, image string) []string {
+	rows, err := db.Query("SELECT DISTINCT owner_name FROM owners WHERE image = ?", image)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		names = append(names, name)
+	}
+	return names
 }
 
 // unsanitizeImageRef converts a sanitized image reference (where /, @, : are

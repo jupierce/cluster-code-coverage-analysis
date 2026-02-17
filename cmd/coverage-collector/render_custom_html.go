@@ -25,7 +25,7 @@ type FileCoverageReport struct {
 
 // buildFileCoverageReports parses a merged coverage file and builds per-file reports
 // with annotated source code HTML
-func buildFileCoverageReports(coverageFile, repoPath, moduleName string) ([]FileCoverageReport, error) {
+func buildFileCoverageReports(coverageFile, repoPath, moduleName string, workspaceModules map[string]string) ([]FileCoverageReport, error) {
 	profiles, err := cover.ParseProfiles(coverageFile)
 	if err != nil {
 		return nil, fmt.Errorf("parse profiles: %w", err)
@@ -36,7 +36,11 @@ func buildFileCoverageReports(coverageFile, repoPath, moduleName string) ([]File
 	for _, profile := range profiles {
 		// Resolve relative path within the repo
 		relPath := profile.FileName
-		if moduleName != "" && strings.HasPrefix(relPath, moduleName) {
+		if workspaceModules != nil {
+			if resolved := resolveWorkspacePath(relPath, workspaceModules); resolved != "" {
+				relPath = resolved
+			}
+		} else if moduleName != "" && strings.HasPrefix(relPath, moduleName) {
 			relPath = strings.TrimPrefix(relPath, moduleName)
 			relPath = strings.TrimPrefix(relPath, "/")
 		}

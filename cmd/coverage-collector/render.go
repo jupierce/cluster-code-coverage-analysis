@@ -322,50 +322,68 @@ func generateHTMLForOwner(clusterDir string, owner *OwnerReport, imageSources ma
 		return fmt.Errorf("no source repository found for package path")
 	}
 
+	// Check for go.work workspace (monorepo with multiple modules).
+	// If the matched repo is a sub-module inside a workspace, walk up
+	// to find the workspace root so all modules resolve correctly.
+	workspaceModules := parseGoWorkModules(repoPath)
+	if workspaceModules == nil {
+		if wsRoot := findWorkspaceRoot(repoPath, reposDir); wsRoot != "" {
+			workspaceModules = parseGoWorkModules(wsRoot)
+			if workspaceModules != nil {
+				repoPath = wsRoot
+				fmt.Printf("  Found workspace root: %s\n", wsRoot)
+			}
+		}
+	}
+
 	moduleName := getModuleName(repoPath)
 	covFileToUse := owner.MergedCovFile
 
-	// Check if coverage file needs path rewriting
-	needsRewrite := false
-	rewriteOldPath := packagePath
+	if workspaceModules == nil {
+		// Non-workspace repo: use existing path rewrite logic
+		needsRewrite := false
+		rewriteOldPath := packagePath
 
-	if moduleName != "" && packagePath != "" && !strings.HasPrefix(packagePath, moduleName) {
-		needsRewrite = true
-	}
-
-	// Handle /workspace/ paths
-	if !needsRewrite {
-		if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
-			content := string(data)
-			if strings.Contains(content, "/workspace/") && moduleName != "" {
-				needsRewrite = true
-				rewriteOldPath = "/workspace/"
-			}
+		if moduleName != "" && packagePath != "" && !strings.HasPrefix(packagePath, moduleName) {
+			needsRewrite = true
 		}
-	}
 
-	// Handle /go/src/ prefixed paths
-	if !needsRewrite {
-		if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
-			if strings.Contains(string(data), "/go/src/") {
-				needsRewrite = true
-				if moduleName != "" {
-					rewriteOldPath = "/go/src/" + moduleName
+		// Handle /workspace/ paths
+		if !needsRewrite {
+			if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
+				content := string(data)
+				if strings.Contains(content, "/workspace/") && moduleName != "" {
+					needsRewrite = true
+					rewriteOldPath = "/workspace/"
 				}
 			}
 		}
-	}
 
-	if needsRewrite {
-		rewrittenFile, err := rewriteCoveragePaths(covFileToUse, rewriteOldPath, moduleName)
-		if err == nil {
-			covFileToUse = rewrittenFile
-			defer os.Remove(rewrittenFile)
+		// Handle /go/src/ prefixed paths
+		if !needsRewrite {
+			if data, err := os.ReadFile(owner.MergedCovFile); err == nil {
+				if strings.Contains(string(data), "/go/src/") {
+					needsRewrite = true
+					if moduleName != "" {
+						rewriteOldPath = "/go/src/" + moduleName
+					}
+				}
+			}
 		}
+
+		if needsRewrite {
+			rewrittenFile, err := rewriteCoveragePaths(covFileToUse, rewriteOldPath, moduleName)
+			if err == nil {
+				covFileToUse = rewrittenFile
+				defer os.Remove(rewrittenFile)
+			}
+		}
+	} else {
+		fmt.Printf("  go.work detected with %d workspace modules\n", len(workspaceModules))
 	}
 
 	// Filter out coverage lines for source files that don't exist in the repo
-	if filteredFile, wasFiltered := filterMissingSourceFiles(covFileToUse, repoPath); wasFiltered {
+	if filteredFile, wasFiltered := filterMissingSourceFiles(covFileToUse, repoPath, workspaceModules); wasFiltered {
 		if covFileToUse != owner.MergedCovFile {
 			os.Remove(covFileToUse)
 		}
@@ -383,7 +401,7 @@ func generateHTMLForOwner(clusterDir string, owner *OwnerReport, imageSources ma
 
 	absOutputPath := filepath.Join(absOutputDir, htmlFile)
 
-	fileReports, err := buildFileCoverageReports(covFileToUse, repoPath, moduleName)
+	fileReports, err := buildFileCoverageReports(covFileToUse, repoPath, moduleName, workspaceModules)
 	if err != nil {
 		return fmt.Errorf("build file coverage reports: %w", err)
 	}
@@ -757,6 +775,109 @@ func extractModulePrefix(packagePath string) string {
 	return packagePath
 }
 
+// parseGoWorkModules parses go.work in repoPath and returns a map of
+// moduleName → relativeDir for each workspace member. Returns nil if
+// no go.work exists. This enables correct path resolution for monorepos
+// like kubernetes where coverage data spans multiple modules.
+func parseGoWorkModules(repoPath string) map[string]string {
+	goWork := filepath.Join(repoPath, "go.work")
+	data, err := os.ReadFile(goWork)
+	if err != nil {
+		return nil
+	}
+
+	moduleMap := make(map[string]string)
+	inUseBlock := false
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "use (") {
+			inUseBlock = true
+			continue
+		}
+		if inUseBlock && line == ")" {
+			inUseBlock = false
+			continue
+		}
+		if strings.HasPrefix(line, "use ") && !strings.Contains(line, "(") {
+			// Single-line use directive
+			dir := strings.TrimSpace(strings.TrimPrefix(line, "use "))
+			dir = strings.TrimPrefix(dir, "./")
+			modName := getModuleName(filepath.Join(repoPath, dir))
+			if modName != "" {
+				moduleMap[modName] = dir
+			}
+			continue
+		}
+		if inUseBlock {
+			dir := strings.TrimPrefix(line, "./")
+			if dir == "" || strings.HasPrefix(dir, "//") {
+				continue
+			}
+			modName := getModuleName(filepath.Join(repoPath, dir))
+			if modName != "" {
+				moduleMap[modName] = dir
+			}
+		}
+	}
+
+	if len(moduleMap) == 0 {
+		return nil
+	}
+	return moduleMap
+}
+
+// findWorkspaceRoot walks up from repoPath looking for a parent directory
+// that contains a go.work file, stopping at reposDir (the repos/ root).
+// Returns the workspace root path, or "" if none found.
+func findWorkspaceRoot(repoPath, reposDir string) string {
+	absRepo, _ := filepath.Abs(repoPath)
+	absRepos, _ := filepath.Abs(reposDir)
+
+	dir := filepath.Dir(absRepo)
+	for {
+		// Don't walk above the repos directory
+		if len(dir) <= len(absRepos) {
+			break
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.work")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// resolveWorkspacePath resolves a coverage file path (e.g. "k8s.io/api/admission/v1/types.go")
+// to a repo-relative path (e.g. "staging/src/k8s.io/api/admission/v1/types.go") using
+// the workspace module map. Returns "" if no matching module is found.
+func resolveWorkspacePath(fileName string, moduleMap map[string]string) string {
+	bestMod := ""
+	bestDir := ""
+	for mod, dir := range moduleMap {
+		if strings.HasPrefix(fileName, mod+"/") || fileName == mod {
+			if len(mod) > len(bestMod) {
+				bestMod = mod
+				bestDir = dir
+			}
+		}
+	}
+	if bestMod == "" {
+		return ""
+	}
+	relPath := strings.TrimPrefix(fileName, bestMod)
+	relPath = strings.TrimPrefix(relPath, "/")
+	if bestDir == "." || bestDir == "" {
+		return relPath
+	}
+	return filepath.Join(bestDir, relPath)
+}
+
 func rewriteCoveragePaths(coverageFile, oldPath, newPath string) (string, error) {
 	data, err := os.ReadFile(coverageFile)
 	if err != nil {
@@ -787,7 +908,7 @@ func rewriteCoveragePaths(coverageFile, oldPath, newPath string) (string, error)
 	return tmpFile.Name(), nil
 }
 
-func filterMissingSourceFiles(coverageFile, repoPath string) (string, bool) {
+func filterMissingSourceFiles(coverageFile, repoPath string, workspaceModules map[string]string) (string, bool) {
 	data, err := os.ReadFile(coverageFile)
 	if err != nil {
 		return coverageFile, false
@@ -820,7 +941,11 @@ func filterMissingSourceFiles(coverageFile, repoPath string) (string, bool) {
 		filePath := fileAndLine[:idx]
 
 		relPath := filePath
-		if moduleName != "" && strings.HasPrefix(filePath, moduleName) {
+		if workspaceModules != nil {
+			if resolved := resolveWorkspacePath(filePath, workspaceModules); resolved != "" {
+				relPath = resolved
+			}
+		} else if moduleName != "" && strings.HasPrefix(filePath, moduleName) {
 			relPath = strings.TrimPrefix(filePath, moduleName)
 			relPath = strings.TrimPrefix(relPath, "/")
 		}
