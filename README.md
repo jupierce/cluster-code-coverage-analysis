@@ -86,7 +86,7 @@ Process raw coverage data into an SQLite database. This step:
 - Filters out `coverage_server.go` lines
 - Groups reports by owner (Deployment, DaemonSet, StatefulSet, Job, Host, Pod)
 - Merges coverage from multiple pods of the same owner/binary
-- Resolves source repository URLs from `info.json` files and image labels
+- Resolves source repository URLs from `info.json` files and image labels/env vars
 - Computes per-file coverage statistics
 
 Change detection uses MD5 hashes; only changed reports are reprocessed.
@@ -238,8 +238,10 @@ pods with different names (e.g., static pods with per-node names).
 
 The tool uses a 3-strategy cascade to find source code for annotated reports:
 
-1. **Image labels** (fast): Looks up `io.openshift.build.source-location` /
-   `io.openshift.build.commit.id` from container image labels or `info.json`.
+1. **Image labels/env vars** (fast): Looks up `io.openshift.build.source-location` /
+   `io.openshift.build.commit.id` from container image labels, and
+   `__doozer_group` / `__doozer_key` from image environment variables.
+   Also checks `info.json` files from the coverage producer.
    Validates that the repo's Go module matches the coverage package path.
 2. **Package path matching**: Walks cloned repos and scores by Go module prefix
    match.
@@ -247,6 +249,62 @@ The tool uses a 3-strategy cascade to find source code for annotated reports:
 
 For host binaries (no container image), source info comes from `info.json` files
 using synthetic `host:<binary_name>` keys.
+
+## BigQuery Ingest
+
+The `bigquery` command group persists coverage data from the SQLite database
+into BigQuery for cross-collection analysis and querying.
+
+```bash
+# Ingest all coverage data
+coverage-collector bigquery --project my-gcp-project --dataset my_dataset \
+    ingest --collection my-collection
+
+# Ingest only specific namespaces
+coverage-collector bigquery --project my-gcp-project --dataset my_dataset \
+    ingest --collection my-collection \
+    --namespace 'openshift-apiserver' --namespace 'openshift-etcd'
+
+# Filter by owner name
+coverage-collector bigquery --project my-gcp-project --dataset my_dataset \
+    ingest --collection my-collection \
+    --owner 'kube-apiserver' --owner 'etcd'
+```
+
+**Flags (bigquery group):**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--project` | *(required)* | GCP project ID |
+| `--dataset` | *(required)* | BigQuery dataset name |
+
+**Flags (ingest subcommand):**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--collection` | *(required)* | Collection name (same as cluster subcommands) |
+| `--namespace` | `*` | Namespace glob filter (repeatable, OR logic) |
+| `--owner` | `*` | Owner name glob filter (repeatable, OR logic) |
+
+### BigQuery Tables
+
+Two tables are created automatically:
+
+- **`coverage_data`**: One row per source line per binary. Includes source code
+  text, line number, and execution count. Partitioned by `ingestion_time`,
+  clustered by `(binary_hash, collection_id)`.
+
+- **`coverage_generators`**: One row per unique binary hash. Lists all owners
+  (namespace, owner, container, binary) as a repeated record. Includes
+  `software_group` and `software_key` metadata from the coverage producer.
+  Partitioned by `ingestion_time`, clustered by
+  `(software_group, binary_hash, collection_id, source_url)`.
+
+### Authentication
+
+Uses GCP Application Default Credentials. Run `gcloud auth application-default
+login` before using, or set the `GOOGLE_APPLICATION_CREDENTIALS` environment
+variable.
 
 ## Prerequisites
 
@@ -261,7 +319,11 @@ using synthetic `host:<binary_name>` keys.
 4. **Git**: Required by `clone-sources` to clone repositories.
 
 5. **`oc` CLI** *(optional)*: Used during `compile` to inspect container image
-   labels for source repository info. Falls back to `info.json` if unavailable.
+   labels and environment variables for source repository and software group/key
+   info. Falls back to `info.json` if unavailable.
+
+6. **GCP credentials** *(for BigQuery ingest)*: `gcloud auth application-default
+   login` or `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
 
 ## Acknowledgments
 

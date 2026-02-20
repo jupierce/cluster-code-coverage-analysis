@@ -27,6 +27,7 @@ cmd/coverage-collector/
   clone_sources.go     # Git clone subcommand (reads image_sources from DB)
   render.go            # HTML report generation (hash-group based), index.html template
   render_custom_html.go # Per-file source annotation HTML renderer + template
+  bigquery.go          # BigQuery command group + ingest subcommand
 pkg/
   log/                 # Logger package
 reports/               # Collection data directories (gitignored)
@@ -54,8 +55,9 @@ go build ./cmd/coverage-collector/
 - `golang.org/x/tools/cover` (coverage profile parsing)
 - `github.com/spf13/cobra` (CLI framework)
 - `modernc.org/sqlite` (pure Go SQLite driver, no CGo)
+- `cloud.google.com/go/bigquery` (BigQuery client for ingest)
 
-## Database Schema (v4)
+## Database Schema (v5)
 
 | Table | Purpose |
 |-------|---------|
@@ -63,8 +65,13 @@ go build ./cmd/coverage-collector/
 | `owners` | One row per owner/binary/covmetaHash group (merged results) |
 | `owner_reports` | Many-to-many join (owner <-> reports) |
 | `owner_file_stats` | Per-file coverage stats for each owner |
-| `image_sources` | Image ref (or `host:<binary>`) -> source repo URL + commit ID |
+| `image_sources` | Image ref (or `host:<binary>`) -> source repo URL + commit ID + software_group/key |
 | `schema_version` | Tracks schema version for migrations |
+
+The `image_sources` table includes `software_group` and `software_key` columns
+(added in v5) populated from `info.json` fields written by the coverage
+producer. These correspond to the `X-Art-Coverage-Software-Group` and
+`X-Art-Coverage-Software-Key` HTTP headers served by the coverage server.
 
 The database (`coverage.db`) stores all coverage text, merged results, per-file
 stats, and image source mappings. Typically ~7GB for a full cluster.
@@ -139,15 +146,28 @@ pods running the same binary.
 Two mechanisms populate the `image_sources` table:
 
 1. **info.json** (`populateImageSourcesFromInfoJSON`): Scans report directories
-   for `info.json` files containing `source_url` and `source_commit` fields.
+   for `info.json` files containing `source_url`, `source_commit`,
+   `software_group`, and `software_key` fields. An entry is created if any of
+   these fields are non-empty (e.g., an info.json with only `software_group`
+   and `software_key` but no `source_url` is still processed).
    Works for both container and host reports. Host reports use synthetic keys
-   `host:<binary_name>` since they have no container image.
+   `host:<binary_name>` since they have no container image. All fields use
+   conditional UPSERT: non-empty values are written but never overwrite
+   existing non-empty values (applies to `source_repo`, `commit_id`,
+   `software_group`, and `software_key`). Re-processes entries that are
+   missing `software_group` or `software_key` even if `source_repo` is
+   already resolved.
 
 2. **Image label inspection** (`inspectImages`): Uses `oc image info -o json`
    to read `io.openshift.build.source-location` and
-   `io.openshift.build.commit.id` labels from container images. Includes
-   fallbacks for manifest lists (`--filter-by-os=linux/amd64`) and release
-   payloads (`oc adm release info --image-for`).
+   `io.openshift.build.commit.id` labels from container images. Also extracts
+   `__doozer_group` and `__doozer_key` environment variables from the image
+   config as fallback values for `software_group` and `software_key` (only
+   used if info.json didn't already provide them). Includes fallbacks for
+   manifest lists (`--filter-by-os=linux/amd64`) and release payloads
+   (`oc adm release info --image-for`), extracting doozer env vars from each
+   fallback path as well. Re-inspects images that are missing software_group
+   or software_key even if source labels were already resolved.
 
 ### Compile Flags
 
@@ -287,6 +307,83 @@ Interactive dashboard with:
 After generating the index, render removes any `.html` files in the output
 directory that are not referenced by current owners (`index.html` is always
 kept). This cleans up files from previous runs that are no longer needed.
+
+## BigQuery Ingest (`bigquery.go`)
+
+The `bigquery` command group provides a top-level `ingest` subcommand for
+persisting coverage data from the SQLite database into BigQuery for
+cross-collection analysis.
+
+```
+coverage-collector bigquery --project <gcp-project> --dataset <dataset> \
+    ingest --collection <name> [--namespace <glob>...] [--owner <glob>...]
+```
+
+### Command Structure
+
+- `bigqueryCmd`: Top-level command with persistent `--project` and `--dataset` flags
+- `ingestCmd`: Subcommand with `--collection` (required), `--namespace` (repeatable,
+  default `["*"]`), `--owner` (repeatable, default `["*"]`)
+
+Namespace and owner filters use OR logic across repeated values, AND logic
+between the two filter types.
+
+### BigQuery Tables
+
+#### `coverage_data`
+
+Partitioned by `ingestion_time`, clustered by `(binary_hash, collection_id)`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `ingestion_time` | TIMESTAMP | UTC moment the ingest started (same for all rows in a run) |
+| `binary_hash` | STRING | Covmeta hash of the binary |
+| `collection_id` | STRING | Value of `--collection` |
+| `source_filename` | STRING | File path from coverage profile |
+| `source_line` | STRING | Actual source code text (empty if source not resolved) |
+| `source_line_number` | INT64 | 1-based line number |
+| `line_executions` | INT64 | Max execution count across blocks covering this line. -1 = not tracked |
+
+#### `coverage_generators`
+
+Partitioned by `ingestion_time`, clustered by
+`(software_group, binary_hash, collection_id, source_url)`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `ingestion_time` | TIMESTAMP | Same key as coverage_data |
+| `software_group` | STRING | From `image_sources.software_group` |
+| `binary_hash` | STRING | Covmeta hash |
+| `collection_id` | STRING | Value of `--collection` |
+| `source_url` | STRING | From `image_sources.source_repo` |
+| `software_key` | STRING | From `image_sources.software_key` |
+| `source_commit` | STRING | From `image_sources.commit_id` |
+| `generators` | REPEATED RECORD | One entry per owner of this binary hash |
+| `generators.namespace` | STRING | |
+| `generators.owner` | STRING | |
+| `generators.container` | STRING | |
+| `generators.binary_name` | STRING | |
+
+### Ingest Flow
+
+1. Open SQLite DB read-only
+2. Load owners via `loadOwnersForRender()`, filter by `--namespace`/`--owner` globs
+3. Group filtered owners by covmeta hash (same hash-group logic as render)
+4. Merge coverage texts per hash group via `mergeCoverageTexts()`
+5. Create BigQuery client, dataset, and tables (auto-creates if not exist)
+6. For each hash group:
+   - Resolve source repo (same 3-strategy cascade as render)
+   - Parse merged coverage with `cover.ParseProfiles()`
+   - Read source files, compute per-line execution counts
+   - Build `CoverageDataRow` structs (one per source line)
+   - Read `software_group`/`software_key` from `imageSource` structs
+   - Build `CoverageGeneratorsRow` with all owners as `generators` entries
+7. Stream rows into BigQuery via `Inserter.Put()` in batches of 500
+
+### Authentication
+
+Uses Application Default Credentials (ADC). User must run
+`gcloud auth application-default login` or set `GOOGLE_APPLICATION_CREDENTIALS`.
 
 ---
 

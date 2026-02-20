@@ -66,7 +66,7 @@ func init() {
 // Schema
 // ---------------------------------------------------------------------------
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 func createSchema(db *sql.DB) error {
 	_, err := db.Exec(`
@@ -132,7 +132,9 @@ func createSchema(db *sql.DB) error {
 			source_repo     TEXT NOT NULL DEFAULT '',
 			commit_id       TEXT NOT NULL DEFAULT '',
 			inspected_at    TEXT NOT NULL DEFAULT '',
-			error_msg       TEXT NOT NULL DEFAULT ''
+			error_msg       TEXT NOT NULL DEFAULT '',
+			software_group  TEXT NOT NULL DEFAULT '',
+			software_key    TEXT NOT NULL DEFAULT ''
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_report_sources_namespace ON report_sources(namespace);
@@ -181,6 +183,15 @@ func createSchema(db *sql.DB) error {
 		_, alterErr := db.Exec("ALTER TABLE owners ADD COLUMN hosts_json TEXT NOT NULL DEFAULT '[]'")
 		if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column") {
 			return fmt.Errorf("migrate v3→v4: %w", alterErr)
+		}
+	}
+	if currentVersion < 5 {
+		// v4 → v5: add software_group, software_key columns to image_sources table
+		for _, col := range []string{"software_group", "software_key"} {
+			_, alterErr := db.Exec(fmt.Sprintf("ALTER TABLE image_sources ADD COLUMN %s TEXT NOT NULL DEFAULT ''", col))
+			if alterErr != nil && !strings.Contains(alterErr.Error(), "duplicate column") {
+				return fmt.Errorf("migrate v4→v5 (%s): %w", col, alterErr)
+			}
 		}
 	}
 	if currentVersion < schemaVersion {
@@ -596,14 +607,17 @@ func computePerFileStats(text string) []fileStats {
 // For host reports (no image), a synthetic key "host:<binary_name>" is used
 // so that the render step can look up source info for host-type owners.
 func populateImageSourcesFromInfoJSON(db *sql.DB, coverageDir string) error {
-	// Find report sources that don't yet have a resolved source_repo.
+	// Find report sources that don't yet have a fully resolved image_sources entry.
+	// An entry is considered incomplete if it's missing source_repo OR software_group/software_key.
 	// Include host reports (which have no image) by using a synthetic key.
 	rows, err := db.Query(`
 		SELECT rs.image, rs.dir_name, rs.is_host, rs.binary_name FROM report_sources rs
 		WHERE rs.dir_name NOT IN (
 		    SELECT dir_name FROM report_sources rs2
 		    WHERE rs2.image != '' AND rs2.image IN (
-		        SELECT image FROM image_sources WHERE source_repo != '' AND error_msg = ''
+		        SELECT image FROM image_sources
+		        WHERE source_repo != '' AND error_msg = ''
+		        AND software_group != '' AND software_key != ''
 		    )
 		)
 	`)
@@ -660,7 +674,12 @@ func populateImageSourcesFromInfoJSON(db *sql.DB, coverageDir string) error {
 		// info.json uses "source_url" for the repo URL
 		sourceRepo, _ := info["source_url"].(string)
 		sourceCommit, _ := info["source_commit"].(string)
-		if sourceRepo == "" {
+
+		// Read optional software_group and software_key
+		softwareGroup, _ := info["software_group"].(string)
+		softwareKey, _ := info["software_key"].(string)
+
+		if sourceRepo == "" && softwareGroup == "" && softwareKey == "" {
 			continue
 		}
 
@@ -671,16 +690,22 @@ func populateImageSourcesFromInfoJSON(db *sql.DB, coverageDir string) error {
 		}
 
 		db.Exec(`
-			INSERT INTO image_sources (image, source_repo, commit_id, inspected_at, error_msg)
-			VALUES (?, ?, ?, datetime('now'), '')
+			INSERT INTO image_sources (image, source_repo, commit_id, inspected_at, error_msg, software_group, software_key)
+			VALUES (?, ?, ?, datetime('now'), '', ?, ?)
 			ON CONFLICT(image) DO UPDATE SET
-				source_repo = excluded.source_repo,
-				commit_id = excluded.commit_id,
+				source_repo = CASE WHEN excluded.source_repo != '' THEN excluded.source_repo ELSE image_sources.source_repo END,
+				commit_id = CASE WHEN excluded.commit_id != '' THEN excluded.commit_id ELSE image_sources.commit_id END,
 				inspected_at = excluded.inspected_at,
-				error_msg = ''
-		`, imageKey, sourceRepo, sourceCommit)
+				error_msg = '',
+				software_group = CASE WHEN excluded.software_group != '' THEN excluded.software_group ELSE image_sources.software_group END,
+				software_key = CASE WHEN excluded.software_key != '' THEN excluded.software_key ELSE image_sources.software_key END
+		`, imageKey, sourceRepo, sourceCommit, softwareGroup, softwareKey)
 
-		fmt.Printf("  info.json: %s → %s @ %s\n", imageKey, sourceRepo, truncateCommit(sourceCommit))
+		if sourceRepo != "" {
+			fmt.Printf("  info.json: %s → %s @ %s\n", imageKey, sourceRepo, truncateCommit(sourceCommit))
+		} else {
+			fmt.Printf("  info.json: %s → group=%s key=%s\n", imageKey, softwareGroup, softwareKey)
+		}
 		resolved++
 	}
 
@@ -729,17 +754,22 @@ func inspectImages(db *sql.DB) error {
 		return nil
 	}
 
-	// Filter out already-inspected images (with no error)
+	// Filter out already-inspected images. An image needs inspection if:
+	// - it has no image_sources entry at all, or
+	// - it has an error, or
+	// - it is missing software_group/software_key (doozer labels)
 	var toInspect []string
 	for _, img := range images {
 		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM image_sources WHERE image = ? AND error_msg = ''", img).Scan(&count)
+		err := db.QueryRow(`SELECT COUNT(*) FROM image_sources
+			WHERE image = ? AND error_msg = '' AND software_group <> '' AND software_key <> ''`,
+			img).Scan(&count)
 		if err != nil || count == 0 {
 			toInspect = append(toInspect, img)
 		}
 	}
 
-	fmt.Printf("  Found %d unique images (%d already inspected)\n", len(images), len(images)-len(toInspect))
+	fmt.Printf("  Found %d unique images (%d already complete)\n", len(images), len(images)-len(toInspect))
 
 	if len(toInspect) == 0 {
 		return nil
@@ -775,6 +805,7 @@ func inspectImages(db *sql.DB) error {
 			Config struct {
 				Config struct {
 					Labels map[string]string `json:"Labels"`
+					Env    []string          `json:"Env"`
 				} `json:"config"`
 			} `json:"config"`
 		}
@@ -791,8 +822,12 @@ func inspectImages(db *sql.DB) error {
 			continue
 		}
 
-		sourceRepo := info.Config.Config.Labels["io.openshift.build.source-location"]
-		commitID := info.Config.Config.Labels["io.openshift.build.commit.id"]
+		labels := info.Config.Config.Labels
+		sourceRepo := labels["io.openshift.build.source-location"]
+		commitID := labels["io.openshift.build.commit.id"]
+		envVars := parseEnvVars(info.Config.Config.Env)
+		doozerGroup := envVars["__doozer_group"]
+		doozerKey := envVars["__doozer_key"]
 
 		// If no source labels found, try two fallback strategies:
 
@@ -809,14 +844,25 @@ func inspectImages(db *sql.DB) error {
 					Config struct {
 						Config struct {
 							Labels map[string]string `json:"Labels"`
+							Env    []string          `json:"Env"`
 						} `json:"config"`
 					} `json:"config"`
 				}
 				if json.Unmarshal(output2, &info2) == nil {
-					if repo := info2.Config.Config.Labels["io.openshift.build.source-location"]; repo != "" {
+					labels2 := info2.Config.Config.Labels
+					if repo := labels2["io.openshift.build.source-location"]; repo != "" {
 						sourceRepo = repo
-						commitID = info2.Config.Config.Labels["io.openshift.build.commit.id"]
+						commitID = labels2["io.openshift.build.commit.id"]
 						fmt.Printf("  Resolved manifest list via linux/amd64 filter\n")
+					}
+					if doozerGroup == "" || doozerKey == "" {
+						envVars2 := parseEnvVars(info2.Config.Config.Env)
+						if doozerGroup == "" {
+							doozerGroup = envVars2["__doozer_group"]
+						}
+						if doozerKey == "" {
+							doozerKey = envVars2["__doozer_key"]
+						}
 					}
 				}
 			}
@@ -855,14 +901,27 @@ func inspectImages(db *sql.DB) error {
 					Config struct {
 						Config struct {
 							Labels map[string]string `json:"Labels"`
+							Env    []string          `json:"Env"`
 						} `json:"config"`
 					} `json:"config"`
 				}
 				if json.Unmarshal(output4, &info4) == nil {
-					if repo := info4.Config.Config.Labels["io.openshift.build.source-location"]; repo != "" {
+					labels4 := info4.Config.Config.Labels
+					if repo := labels4["io.openshift.build.source-location"]; repo != "" {
 						sourceRepo = repo
-						commitID = info4.Config.Config.Labels["io.openshift.build.commit.id"]
+						commitID = labels4["io.openshift.build.commit.id"]
 						fmt.Printf("  Resolved release payload component %q → %s\n", component, truncateImageRef(componentImage))
+					}
+					if doozerGroup == "" || doozerKey == "" {
+						envVars4 := parseEnvVars(info4.Config.Config.Env)
+						if doozerGroup == "" {
+							doozerGroup = envVars4["__doozer_group"]
+						}
+						if doozerKey == "" {
+							doozerKey = envVars4["__doozer_key"]
+						}
+					}
+					if sourceRepo != "" {
 						break
 					}
 				}
@@ -870,14 +929,16 @@ func inspectImages(db *sql.DB) error {
 		}
 
 		db.Exec(`
-			INSERT INTO image_sources (image, source_repo, commit_id, inspected_at, error_msg)
-			VALUES (?, ?, ?, datetime('now'), '')
+			INSERT INTO image_sources (image, source_repo, commit_id, inspected_at, error_msg, software_group, software_key)
+			VALUES (?, ?, ?, datetime('now'), '', ?, ?)
 			ON CONFLICT(image) DO UPDATE SET
 				source_repo = excluded.source_repo,
 				commit_id = excluded.commit_id,
 				inspected_at = excluded.inspected_at,
-				error_msg = ''
-		`, img, sourceRepo, commitID)
+				error_msg = '',
+				software_group = CASE WHEN image_sources.software_group != '' THEN image_sources.software_group ELSE excluded.software_group END,
+				software_key = CASE WHEN image_sources.software_key != '' THEN image_sources.software_key ELSE excluded.software_key END
+		`, img, sourceRepo, commitID, doozerGroup, doozerKey)
 
 		inspectedCount++
 		if sourceRepo != "" {
@@ -989,6 +1050,18 @@ func truncateImageRef(img string) string {
 		return "..." + img[idx:]
 	}
 	return img
+}
+
+// parseEnvVars converts a slice of "KEY=VALUE" strings (from container image
+// config Env) into a map for easy lookup.
+func parseEnvVars(env []string) map[string]string {
+	m := make(map[string]string, len(env))
+	for _, e := range env {
+		if idx := strings.Index(e, "="); idx >= 0 {
+			m[e[:idx]] = e[idx+1:]
+		}
+	}
+	return m
 }
 
 // truncateCommit shortens a commit hash for display.

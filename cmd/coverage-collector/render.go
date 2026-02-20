@@ -634,13 +634,15 @@ func generateHTMLForOwner(collectionDir string, owner *OwnerReport, imageSources
 // ---------------------------------------------------------------------------
 
 type imageSource struct {
-	SourceRepo string
-	CommitID   string
+	SourceRepo    string
+	CommitID      string
+	SoftwareGroup string
+	SoftwareKey   string
 }
 
 // loadImageSources loads the image→source mapping from the database.
 func loadImageSources(db *sql.DB) (map[string]imageSource, error) {
-	rows, err := db.Query("SELECT image, source_repo, commit_id FROM image_sources WHERE error_msg = '' AND source_repo != ''")
+	rows, err := db.Query("SELECT image, source_repo, commit_id, software_group, software_key FROM image_sources WHERE error_msg = '' AND source_repo != ''")
 	if err != nil {
 		return nil, err
 	}
@@ -648,11 +650,11 @@ func loadImageSources(db *sql.DB) (map[string]imageSource, error) {
 
 	sources := make(map[string]imageSource)
 	for rows.Next() {
-		var img, repo, commit string
-		if err := rows.Scan(&img, &repo, &commit); err != nil {
+		var img, repo, commit, swGroup, swKey string
+		if err := rows.Scan(&img, &repo, &commit, &swGroup, &swKey); err != nil {
 			return nil, err
 		}
-		sources[img] = imageSource{SourceRepo: repo, CommitID: commit}
+		sources[img] = imageSource{SourceRepo: repo, CommitID: commit, SoftwareGroup: swGroup, SoftwareKey: swKey}
 	}
 	return sources, rows.Err()
 }
