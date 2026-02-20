@@ -40,16 +40,16 @@ The compile step:
 Change detection uses MD5 hashes of input files. Only changed reports are
 reprocessed. Use --update to force recomputation of specific entries.`,
 		Example: `  # Compile all coverage data (incremental)
-  coverage-collector cluster compile --cluster my-cluster
+  coverage-collector cluster compile --collection my-collection
 
   # Force full recompilation
-  coverage-collector cluster compile --cluster my-cluster --update '*'
+  coverage-collector cluster compile --collection my-collection --update '*'
 
   # Force recompilation for a namespace
-  coverage-collector cluster compile --cluster my-cluster --update 'namespace=openshift-apiserver'
+  coverage-collector cluster compile --collection my-collection --update 'namespace=openshift-apiserver'
 
   # Force recompilation with multiple filters (AND logic)
-  coverage-collector cluster compile --cluster my-cluster \
+  coverage-collector cluster compile --collection my-collection \
     --update 'namespace=openshift-*' --update 'container=machine-config*'`,
 		RunE: runCompile,
 	}
@@ -1004,8 +1004,8 @@ func truncateCommit(hash string) string {
 // ---------------------------------------------------------------------------
 
 func runCompile(cmd *cobra.Command, args []string) error {
-	clusterDir := clusterName
-	coverageDir := filepath.Join(clusterDir, "coverage")
+	collectionDir := collectionName
+	coverageDir := filepath.Join(collectionDir, "coverage")
 
 	// Parse update filters
 	filters, forceAll, err := parseUpdateFilterFlags(updateFilters)
@@ -1013,10 +1013,10 @@ func runCompile(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Compiling coverage data for cluster: %s\n", clusterName)
+	fmt.Printf("Compiling coverage data for collection: %s\n", collectionName)
 
 	// Open/create SQLite database
-	dbPath := filepath.Join(clusterDir, "coverage.db")
+	dbPath := filepath.Join(collectionDir, "coverage.db")
 	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)

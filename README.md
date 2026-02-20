@@ -1,10 +1,12 @@
 # coverage-collector CLI
 
-A command-line tool for collecting Go code coverage from running applications
-across an entire Kubernetes cluster. It discovers coverage-enabled pods, clones
-source repositories, retrieves coverage data via HTTP port-forwarding, and
-generates interactive HTML reports -- all without requiring `GOCOVERDIR` or
-volume mounts.
+A command-line tool for processing Go code coverage collected from running
+applications across an entire OpenShift/Kubernetes cluster. It downloads
+coverage data from S3, compiles it into a SQLite database, clones source
+repositories, and generates interactive HTML reports with annotated source code.
+
+A "collection" can span multiple cluster lifecycles and is not tied to a single
+cluster instance.
 
 ## Installation
 
@@ -23,123 +25,132 @@ go install github.com/jupierce/cluster-code-coverage-analysis/cmd/coverage-colle
 ## How It Works
 
 Go binaries built with `-cover` can be linked with a small HTTP coverage server
-that serves binary coverage data on a well-known port (default 53700+). When
-such a binary runs inside a Kubernetes pod, `coverage-collector` uses the
-Kubernetes port-forward API to reach that endpoint and download `covmeta.*` /
-`covcounters.*` files without any special volume configuration.
+that serves binary coverage data on a well-known port (default 53700+). A
+coverage producer running on the cluster collects this data and uploads it to
+S3. This tool downloads that data and processes it into interactive HTML reports.
 
 Coverage data is **cumulative**: Go's in-process counters record every code path
-executed since the process started. Running `collect` multiple times (e.g. before
-and after an integration test suite) accumulates additional `covcounters.*` files
-with unique names, so no data is lost.  When `render` runs, it merges all counter
-files for each pod and produces a combined report.
+executed since the process started. Multiple collections accumulate additional
+`covcounters.*` files, so no data is lost. When the data is compiled and
+rendered, all counter files are merged to produce combined reports.
 
 Lines originating from `coverage_server.go` (the embedded HTTP server) are
-automatically filtered out of all reports. Vendor code is excluded at the build
-level by Go's coverage instrumentation and does not appear in reports.
+automatically filtered out of all reports.
 
 ## Workflow
 
-The primary workflow uses the `cluster` command group.  Run these subcommands in
+The primary workflow uses the `cluster` command group. Run these subcommands in
 order:
 
 ```
-coverage-collector cluster discover      --cluster <name>
-coverage-collector cluster clone-sources --cluster <name>
-coverage-collector cluster collect       --cluster <name>
-coverage-collector cluster render        --cluster <name>
+coverage-collector cluster download      --collection <name>  # Download from S3
+coverage-collector cluster compile       --collection <name>  # Build SQLite DB
+coverage-collector cluster clone-sources --collection <name>  # Clone source repos
+coverage-collector cluster render        --collection <name>  # Generate HTML
 ```
 
-### 1. `cluster discover`
+### 1. `cluster download`
 
-Scan the cluster for all pods, inspect their container images, and identify which
-ones were built with coverage enabled.  Produces a **discovery plan**
-(`<cluster>/discovery-plan.json`) that drives subsequent steps.
+Download coverage data (covmeta and covcounters files) from an S3 bucket.
+Generates `metadata.json` for each coverage entry from S3 path components.
 
 ```bash
-# Discover all coverage-enabled pods
-coverage-collector cluster discover --cluster my-cluster
+coverage-collector cluster download --collection my-collection \
+  --bucket art-ocp-code-coverage \
+  --prefix openshift-ci/coverage \
+  --profile saml \
+  --region us-east-1
 
-# Restrict to specific namespaces
-coverage-collector cluster discover --cluster my-cluster \
-  --namespaces openshift-monitoring,openshift-operators
-
-# Skip image inspection (faster, but fewer details in the plan)
-coverage-collector cluster discover --cluster my-cluster --skip-inspection
+# Skip already-downloaded entries
+coverage-collector cluster download --collection my-collection \
+  --bucket art-ocp-code-coverage \
+  --prefix openshift-ci/coverage \
+  --skip-existing
 ```
 
 **Flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--namespaces` | *(all)* | Comma-separated namespaces to scan |
-| `--max-concurrency` | 10 | Concurrent image inspections |
-| `--skip-inspection` | false | Skip image inspection |
-| `--registry-config` | *(auto)* | Path to registry credentials JSON |
+| `--bucket` | *(required)* | S3 bucket name |
+| `--prefix` | *(required)* | S3 path prefix |
+| `--profile` | | AWS CLI profile |
+| `--region` | | AWS region |
+| `--skip-existing` | false | Skip entries that already have local data |
 
-### 2. `cluster clone-sources`
+### 2. `cluster compile`
 
-Clone the Git repositories identified by discovery at the exact commits used to
-build each image.  Sources are stored under `<cluster>/repos/` and are used by
-`render` to produce HTML reports with annotated source code.
+Process raw coverage data into an SQLite database. This step:
+
+- Converts binary coverage to text format via `go tool covdata textfmt`
+- Filters out `coverage_server.go` lines
+- Groups reports by owner (Deployment, DaemonSet, StatefulSet, Job, Host, Pod)
+- Merges coverage from multiple pods of the same owner/binary
+- Resolves source repository URLs from `info.json` files and image labels
+- Computes per-file coverage statistics
+
+Change detection uses MD5 hashes; only changed reports are reprocessed.
 
 ```bash
-coverage-collector cluster clone-sources --cluster my-cluster
+# Incremental compile
+coverage-collector cluster compile --collection my-collection
 
-# Increase parallelism
-coverage-collector cluster clone-sources --cluster my-cluster --max-concurrency 10
+# Force full recompilation
+coverage-collector cluster compile --collection my-collection --update '*'
+
+# Force recompilation for a specific namespace
+coverage-collector cluster compile --collection my-collection \
+  --update 'namespace=openshift-apiserver'
 ```
 
 **Flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--max-concurrency` | 5 | Concurrent git clones |
+| `--update` | | Force recomputation (repeatable, AND logic). Use `'*'` for all, or `field=glob` for `namespace`, `node`, `container`, `image` |
+
+### 3. `cluster clone-sources`
+
+Clone source repositories identified during compile. Uses `source_url` and
+`source_commit` from the `image_sources` table to clone at the exact commit.
+
+```bash
+coverage-collector cluster clone-sources --collection my-collection
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
 | `--skip-existing` | true | Skip already-cloned repositories |
-
-### 3. `cluster collect`
-
-Connect to every coverage-enabled container discovered in step 1 and download
-its binary coverage data via port-forward.
-
-```bash
-coverage-collector cluster collect --cluster my-cluster
-```
-
-Coverage files are saved under `<cluster>/coverage/<namespace>/<pod>/<container>/`.
-Each collection writes new `covcounters.*` files with unique names, so running
-`collect` again after exercising additional code paths adds to the existing data
-rather than replacing it.
-
-**Flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--max-concurrency` | 5 | Concurrent coverage collections |
-| `--process-reports` | false | Generate per-pod HTML reports during collection |
-| `--use-sources` | true | Use cloned sources for path remapping |
 
 ### 4. `cluster render`
 
-Merge per-pod coverage by owner (Deployment, DaemonSet, StatefulSet, Job),
-generate an HTML report for each owner with annotated source code, and build an
-interactive `index.html`.
+Generate HTML reports from the compiled database. Produces one HTML report per
+unique binary (identified by covmeta hash), plus an interactive `index.html`.
+
+Multiple owners running the same binary share a single HTML report. The index
+shows all owners with their individual metadata, linking to the shared report.
 
 ```bash
-# Render to the default location (<cluster>/html/)
-coverage-collector cluster render --cluster my-cluster
+# Render to the default location (<collection>/html/)
+coverage-collector cluster render --collection my-collection
 
-# Render to a custom directory (useful for before/after comparisons)
-coverage-collector cluster render --cluster my-cluster \
-  --output-dir my-cluster/html-post-e2e
+# Render to a custom directory
+coverage-collector cluster render --collection my-collection \
+  --output-dir my-collection/html-post-e2e
+
+# Only generate the index (skip per-binary HTML)
+coverage-collector cluster render --collection my-collection \
+  --skip-component-html
 ```
 
 **Flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--output-dir` | `<cluster>/html` | Output directory for HTML reports |
-| `--skip-html` | false | Only generate the index (skip per-owner HTML) |
+| `--output-dir` | `<collection>/html` | Output directory for HTML reports |
+| `--skip-component-html` | false | Only generate the index |
 
 ### Shared cluster flags
 
@@ -147,115 +158,110 @@ These flags apply to all `cluster` subcommands:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cluster` | *(required)* | Cluster name; also used as the working directory |
+| `--collection` | *(required)* | Collection name; also used as the working directory |
 | `--verbosity` | info | Log verbosity: `error`, `info`, `debug`, `trace` |
-| `--kubeconfig` | *(auto)* | Path to kubeconfig (`$KUBECONFIG` or `~/.kube/config`) |
-
-## Lifecycle Coverage (Before/After Comparisons)
-
-Because counter files accumulate, you can capture coverage at different points
-in a cluster's lifecycle:
-
-```bash
-# 1. After fresh install
-coverage-collector cluster collect --cluster my-cluster
-coverage-collector cluster render  --cluster my-cluster --output-dir my-cluster/html-baseline
-
-# 2. Run your integration / e2e tests against the cluster
-
-# 3. Collect again -- new counters are added alongside the existing ones
-coverage-collector cluster collect --cluster my-cluster
-coverage-collector cluster render  --cluster my-cluster --output-dir my-cluster/html-post-e2e
-```
-
-The post-e2e report will reflect all code executed since each pod started,
-including both the baseline behavior and the additional paths exercised by the
-test suite.  Coverage percentages will only stay the same or increase.
-
-## Single-Pod Collection
-
-A standalone `collect` command is available for collecting coverage from an
-individual pod outside the cluster workflow:
-
-```bash
-# By pod name
-coverage-collector collect --pod my-pod-12345 --test-name my-test
-
-# By label selector
-coverage-collector collect --label app=my-app --test-name my-test --namespace prod
-```
-
-**Flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-p, --pod` | | Pod name (mutually exclusive with `--label`) |
-| `-l, --label` | | Label selector (mutually exclusive with `--pod`) |
-| `-c, --container` | *(auto)* | Container name |
-| `-t, --test-name` | *(required)* | Subdirectory name for output |
-| `--port` | 53700 | Coverage server starting port |
-| `--source-dir` | *(cwd)* | Source directory for path remapping |
-| `--no-path-remap` | false | Disable path remapping |
-| `--timeout` | 60 | Timeout in seconds |
-| `-n, --namespace` | default | Kubernetes namespace |
-| `-o, --output-dir` | ./coverage-output | Output directory |
-
-One of `--pod` or `--label` must be provided.
+| `--max-concurrency` | 8 | Maximum concurrent operations |
 
 ## Directory Structure
 
-After a full run, the cluster directory looks like:
+After a full run, the collection directory looks like:
 
 ```
-<cluster>/
-  discovery-plan.json       # Output of discover
-  clone-summary.json        # Output of clone-sources
-  logs/                     # Timestamped log files
+<collection>/
+  coverage/                 # Raw coverage data from S3
+    <ns>-<pod>-<container>/
+      metadata.json         # Pod/container/binary info
+      info.json             # Source URL/commit (from S3 producer)
+      covmeta.<hash>        # Coverage metadata (deterministic per binary)
+      covcounters.<hash>    # Coverage counters (unique per collection)
+  coverage.db               # SQLite database (~7GB for a full cluster)
   repos/                    # Cloned source repositories
-  coverage/                 # Per-pod binary coverage data
-    <namespace>/
-      <pod>/
-        <container>/
-          covmeta.*          # Coverage metadata (deterministic per binary)
-          covcounters.*      # Coverage counters (unique per collection)
-          coverage.out       # Generated text format
-          coverage_filtered.out
-  html/                     # Rendered HTML reports (default output-dir)
-    index.html              # Interactive index with filtering & sorting
-    <owner>.html            # Per-owner coverage report with source code
+    github.com/<org>/<repo>/<commit-prefix>/
+  html/                     # Generated HTML reports
+    index.html              # Interactive dashboard
+    <hash>.html             # Per-binary coverage reports (named by covmeta hash)
+  logs/                     # Timestamped log files
 ```
 
 ## Interactive Index
 
 The generated `index.html` provides:
 
-- **Search** by namespace, owner name, or container
-- **Filter** by namespace dropdown
-- **Sort** by any column (namespace, owner, type, container, coverage %, statements)
-- **Color-coded** coverage percentages (red < 25%, orange < 50%, yellow < 75%, green >= 75%)
-- **Click-through** to individual HTML reports showing annotated source code
+- **Search** by namespace, owner name, container, or binary
+- **Filter** by namespace, owner type, or coverage level
+- **Sort** by any column (namespace, owner, container/binary, coverage %,
+  statements)
+- **Color-coded** coverage: Excellent (>=70%), Good (>=50%), Moderate (>=30%),
+  Poor (>=15%), Critical (<15%)
+- **Click-through** to per-binary HTML reports with annotated source code
+- **Expandable rows** showing pods, hosts, and image details
+- **Checkbox filters** to hide e2e-* and openshift-must-gather-* namespaces
+  (checked by default)
+- **Deduplicated stats**: Overall coverage percentages are computed by unique
+  binary hash, so the same binary running in multiple owners is only counted
+  once
+
+## Per-Binary HTML Reports
+
+Each `<hash>.html` report includes:
+
+- **Collapsible header** listing all owner groups that run this binary
+  (namespace, type, owner, containers, pod count, hosts)
+- **Stat cards** with source file count, overall coverage %, total and covered
+  statements
+- **File table** with search, coverage level filter, and sortable columns
+- **Source code viewer** with line numbers, green/red coverage highlighting,
+  and per-line execution counts
+- **Split view** mode for viewing the file list alongside source code
+- **Deep linking** via URL hash (`#file0`, `#file1`, etc.)
+- **Unresolved files**: Files without cloned source show "No source code
+  resolved for this file" with their coverage stats still computed
+
+## Owner Grouping
+
+Reports are grouped by owner type, inferred from pod name patterns:
+
+| Pattern | Owner Type |
+|---------|------------|
+| `name-<hash>-<5char>` | Deployment |
+| `name-<number>` | StatefulSet |
+| `name-<5char>` | DaemonSet |
+| `installer-*`, `pruner-*` | Job |
+| Host-level processes | Host |
+| Unrecognized pods | Pod (No Owner) |
+
+Owners with the same binary (same covmeta hash) share a single HTML report.
+This prevents inflated statement counts when the same binary runs in multiple
+pods with different names (e.g., static pods with per-node names).
+
+## Source Repository Resolution
+
+The tool uses a 3-strategy cascade to find source code for annotated reports:
+
+1. **Image labels** (fast): Looks up `io.openshift.build.source-location` /
+   `io.openshift.build.commit.id` from container image labels or `info.json`.
+   Validates that the repo's Go module matches the coverage package path.
+2. **Package path matching**: Walks cloned repos and scores by Go module prefix
+   match.
+3. **Owner name fallback**: Matches owner name to repository directory names.
+
+For host binaries (no container image), source info comes from `info.json` files
+using synthetic `host:<binary_name>` keys.
 
 ## Prerequisites
 
-1. **Coverage-enabled binaries**: Applications must be built with Go's `-cover`
-   flag and linked with an HTTP coverage server listening on port 53700+.
+1. **Coverage data in S3**: The coverage producer must have uploaded covmeta and
+   covcounters files to the configured S3 bucket.
 
-2. **Kubernetes access**: A valid kubeconfig or in-cluster RBAC permissions with
-   access to list pods and create port-forwards.
+2. **Go toolchain**: Required for `go tool covdata textfmt` (converting binary
+   coverage to text format).
 
-3. **Go toolchain**: The `go` command is required for `go tool covdata textfmt`
-   (converting binary coverage to text) and for HTML report generation.
+3. **AWS CLI**: Required by `download` to fetch data from S3.
 
 4. **Git**: Required by `clone-sources` to clone repositories.
 
-## Environment Variables
-
-- `KUBECONFIG` -- Path to kubeconfig file (overridden by `--kubeconfig` flag)
-
-## Exit Codes
-
-- `0` -- Success
-- `1` -- Error
+5. **`oc` CLI** *(optional)*: Used during `compile` to inspect container image
+   labels for source repository info. Falls back to `info.json` if unavailable.
 
 ## Acknowledgments
 

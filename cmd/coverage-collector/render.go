@@ -73,23 +73,23 @@ Reads owner data from the SQLite database (created by 'compile') and generates
 individual HTML reports for each owner with an interactive index.html featuring
 filtering, sorting, and color-coded coverage indicators.
 
-Requires source repositories in <cluster>/repos/ for annotated HTML reports.`,
+Requires source repositories in <collection>/repos/ for annotated HTML reports.`,
 	RunE: runRenderE,
 }
 
 func init() {
-	renderCmd.Flags().StringVar(&renderOutputDir, "output-dir", "", "Output directory for HTML reports (default: <cluster>/html)")
+	renderCmd.Flags().StringVar(&renderOutputDir, "output-dir", "", "Output directory for HTML reports (default: <collection>/html)")
 	renderCmd.Flags().BoolVar(&renderSkipComponentHTML, "skip-component-html", false, "Skip generating individual component HTML reports (only create index)")
 	clusterCmd.AddCommand(renderCmd)
 }
 
 func runRenderE(cmd *cobra.Command, args []string) error {
-	clusterDir := clusterName
+	collectionDir := collectionName
 	if renderOutputDir == "" {
-		renderOutputDir = filepath.Join(clusterDir, "html")
+		renderOutputDir = filepath.Join(collectionDir, "html")
 	}
 
-	fmt.Printf("Rendering coverage reports for cluster: %s\n", clusterName)
+	fmt.Printf("Rendering coverage reports for collection: %s\n", collectionName)
 	fmt.Printf("Output directory: %s\n\n", renderOutputDir)
 
 	// Create output directory
@@ -98,7 +98,7 @@ func runRenderE(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open SQLite database (read-only)
-	dbPath := filepath.Join(clusterDir, "coverage.db")
+	dbPath := filepath.Join(collectionDir, "coverage.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		return fmt.Errorf("database not found at %s — run 'compile' first", dbPath)
 	}
@@ -234,7 +234,7 @@ func runRenderE(cmd *cobra.Command, args []string) error {
 
 				syntheticOwner := buildSyntheticOwner(hg.owners, imageSources)
 				syntheticOwner.HTMLFile = htmlFile // pre-set so generateHTMLForOwner uses this filename
-				if err := generateHTMLForOwnerFromDB(clusterDir, syntheticOwner, imageSources); err != nil {
+				if err := generateHTMLForOwnerFromDB(collectionDir, syntheticOwner, imageSources); err != nil {
 					n := progress.Add(1)
 					fmt.Printf("[%d/%d] %s: %v\n", n+int64(cachedCount), totalGroups, htmlFile, err)
 					atomic.AddInt64(&errorCount, 1)
@@ -457,7 +457,7 @@ func buildSyntheticOwner(owners []*OwnerReport, imageSources map[string]imageSou
 
 // generateHTMLForOwnerFromDB writes the merged coverage text from DB to a temp file,
 // then runs the existing HTML generation pipeline.
-func generateHTMLForOwnerFromDB(clusterDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
+func generateHTMLForOwnerFromDB(collectionDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
 	// Write merged coverage text to temp file
 	tmpFile, err := os.CreateTemp("", "coverage-merged-*.out")
 	if err != nil {
@@ -474,13 +474,13 @@ func generateHTMLForOwnerFromDB(clusterDir string, owner *OwnerReport, imageSour
 
 	owner.MergedCovFile = tmpPath
 
-	return generateHTMLForOwner(clusterDir, owner, imageSources)
+	return generateHTMLForOwner(collectionDir, owner, imageSources)
 }
 
 // generateHTMLForOwner generates an HTML coverage report for an owner.
 // It expects owner.MergedCovFile to be set to a file containing the merged coverage text.
-func generateHTMLForOwner(clusterDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
-	reposDir := filepath.Join(clusterDir, "repos")
+func generateHTMLForOwner(collectionDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
+	reposDir := filepath.Join(collectionDir, "repos")
 	var repoPath string
 
 	// Extract package path from coverage (needed for path rewriting regardless of repo lookup strategy)

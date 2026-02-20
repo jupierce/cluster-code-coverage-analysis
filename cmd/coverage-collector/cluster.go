@@ -10,8 +10,8 @@ import (
 )
 
 var (
-	// Cluster command flags
-	clusterName    string
+	// Collection flag
+	collectionName string
 	verbosity      string
 	maxConcurrency int
 
@@ -35,14 +35,14 @@ func init() {
 	rootCmd.AddCommand(clusterCmd)
 
 	// Cluster-wide flags
-	clusterCmd.PersistentFlags().StringVar(&clusterName, "cluster", "", "Cluster name (required, creates directory with this name)")
+	clusterCmd.PersistentFlags().StringVar(&collectionName, "collection", "", "Collection name (required, creates directory with this name)")
 	clusterCmd.PersistentFlags().StringVar(&verbosity, "verbosity", "info", "Log verbosity (error, info, debug, trace)")
 	clusterCmd.PersistentFlags().IntVar(&maxConcurrency, "max-concurrency", 8, "Maximum concurrent operations")
-	clusterCmd.MarkPersistentFlagRequired("cluster")
+	clusterCmd.MarkPersistentFlagRequired("collection")
 }
 
 // createLogger creates a logger for cluster operations
-func createLogger(clusterDir string) (*log.Logger, error) {
+func createLogger(collectionDir string) (*log.Logger, error) {
 	// Parse verbosity level
 	level, err := log.ParseLevel(verbosity)
 	if err != nil {
@@ -50,7 +50,7 @@ func createLogger(clusterDir string) (*log.Logger, error) {
 	}
 
 	// Create log directory
-	logDir := filepath.Join(clusterDir, "logs")
+	logDir := filepath.Join(collectionDir, "logs")
 	logger, err := log.New(level, logDir)
 	if err != nil {
 		return nil, fmt.Errorf("create logger: %w", err)

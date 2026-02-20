@@ -25,14 +25,14 @@ var (
 by inspecting container image labels.
 
 Each unique (source_repo, commit_id) pair from the image_sources table
-is cloned into <cluster>/repos/<host>/<org>/<repo>/<commit-prefix>/.
+is cloned into <collection>/repos/<host>/<org>/<repo>/<commit-prefix>/.
 
 Requires 'git' to be available in PATH.`,
 		Example: `  # Clone all source repos
-  coverage-collector cluster clone-sources --cluster my-cluster
+  coverage-collector cluster clone-sources --collection my-collection
 
   # Clone with higher concurrency
-  coverage-collector cluster clone-sources --cluster my-cluster --max-concurrency 10`,
+  coverage-collector cluster clone-sources --collection my-collection --max-concurrency 10`,
 		RunE: runCloneSources,
 	}
 )
@@ -49,10 +49,10 @@ type cloneTarget struct {
 }
 
 func runCloneSources(cmd *cobra.Command, args []string) error {
-	clusterDir := clusterName
+	collectionDir := collectionName
 
 	// Open database read-only
-	dbPath := filepath.Join(clusterDir, "coverage.db")
+	dbPath := filepath.Join(collectionDir, "coverage.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		return fmt.Errorf("database not found at %s — run 'compile' first", dbPath)
 	}
@@ -73,7 +73,7 @@ func runCloneSources(cmd *cobra.Command, args []string) error {
 	}
 	defer rows.Close()
 
-	reposDir := filepath.Join(clusterDir, "repos")
+	reposDir := filepath.Join(collectionDir, "repos")
 
 	var targets []cloneTarget
 	skippedCount := 0

@@ -34,14 +34,14 @@ The coverage producer (running in the kubelet) uploads coverage data to S3
 in a structured path layout. This command downloads that data and prepares
 it for rendering.`,
 		Example: `  # Download coverage data
-  coverage-collector cluster download --cluster my-cluster \
+  coverage-collector cluster download --collection my-collection \
     --bucket art-ocp-code-coverage \
     --prefix openshift-ci/coverage \
     --profile saml \
     --region us-east-1
 
   # Skip already-downloaded entries
-  coverage-collector cluster download --cluster my-cluster \
+  coverage-collector cluster download --collection my-collection \
     --bucket art-ocp-code-coverage \
     --prefix openshift-ci/coverage \
     --skip-existing`,
@@ -131,14 +131,14 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("aws CLI not found in PATH. Install it from https://aws.amazon.com/cli/")
 	}
 
-	clusterDir := clusterName
-	coverageDir := filepath.Join(clusterDir, "coverage")
+	collectionDir := collectionName
+	coverageDir := filepath.Join(collectionDir, "coverage")
 	if err := os.MkdirAll(coverageDir, 0755); err != nil {
 		return fmt.Errorf("create coverage directory: %w", err)
 	}
 
 	fmt.Printf("Downloading coverage data from s3://%s/%s/\n", s3Bucket, s3Prefix)
-	fmt.Printf("Cluster directory: %s\n\n", clusterDir)
+	fmt.Printf("Collection directory: %s\n\n", collectionDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -284,7 +284,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 	if errorCount > 0 {
 		fmt.Printf("Errors: %d\n", errorCount)
 	}
-	fmt.Printf("\nCoverage data saved to: %s/coverage/\n", clusterDir)
+	fmt.Printf("\nCoverage data saved to: %s/coverage/\n", collectionDir)
 
 	return nil
 }
