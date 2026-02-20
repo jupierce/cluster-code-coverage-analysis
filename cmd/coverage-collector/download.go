@@ -154,7 +154,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 	var covObjects []s3Object
 	for _, obj := range objects {
 		basename := filepath.Base(obj.Key)
-		if strings.HasPrefix(basename, "covmeta.") || strings.HasPrefix(basename, "covcounters.") {
+		if strings.HasPrefix(basename, "covmeta.") || strings.HasPrefix(basename, "covcounters.") || basename == "info.json" {
 			covObjects = append(covObjects, obj)
 		}
 	}
@@ -374,7 +374,7 @@ func parseS3Entries(objects []s3Object) ([]coverageEntry, error) {
 		dirParts := parts[:len(parts)-1]
 
 		// Skip if not a coverage file
-		if !strings.HasPrefix(filename, "covmeta.") && !strings.HasPrefix(filename, "covcounters.") {
+		if !strings.HasPrefix(filename, "covmeta.") && !strings.HasPrefix(filename, "covcounters.") && filename != "info.json" {
 			continue
 		}
 
@@ -470,6 +470,7 @@ func deduplicateEntries(entries []coverageEntry) []coverageEntry {
 
 func selectCounterFiles(entry *coverageEntry) {
 	var metaFiles []s3Object
+	var otherFiles []s3Object // non-coverage files like info.json
 	var counter1Files []s3Object
 	var counter2Files []s3Object
 	var counter1Latest time.Time
@@ -479,6 +480,10 @@ func selectCounterFiles(entry *coverageEntry) {
 		basename := filepath.Base(f.Key)
 		if strings.HasPrefix(basename, "covmeta.") {
 			metaFiles = append(metaFiles, f)
+			continue
+		}
+		if basename == "info.json" {
+			otherFiles = append(otherFiles, f)
 			continue
 		}
 		if strings.HasPrefix(basename, "covcounters.") {
@@ -511,6 +516,7 @@ func selectCounterFiles(entry *coverageEntry) {
 	}
 
 	entry.Files = append(metaFiles, selectedCounters...)
+	entry.Files = append(entry.Files, otherFiles...)
 }
 
 // ---------------------------------------------------------------------------

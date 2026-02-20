@@ -45,13 +45,6 @@ func buildFileCoverageReports(coverageFile, repoPath, moduleName string, workspa
 			relPath = strings.TrimPrefix(relPath, "/")
 		}
 
-		absPath := filepath.Join(repoPath, relPath)
-		src, err := os.ReadFile(absPath)
-		if err != nil {
-			// Skip files that can't be found (generated files, vendored, etc.)
-			continue
-		}
-
 		// Compute per-file stats
 		totalStmts := 0
 		coveredStmts := 0
@@ -67,7 +60,13 @@ func buildFileCoverageReports(coverageFile, repoPath, moduleName string, workspa
 			coverage = float64(coveredStmts) / float64(totalStmts) * 100
 		}
 
-		bodyHTML := annotateSource(src, profile)
+		absPath := filepath.Join(repoPath, relPath)
+		var bodyHTML template.HTML
+		if src, err := os.ReadFile(absPath); err == nil {
+			bodyHTML = annotateSource(src, profile)
+		} else {
+			bodyHTML = template.HTML(`<div class="no-source">No source code resolved for this file</div>`)
+		}
 
 		reports = append(reports, FileCoverageReport{
 			Path:         relPath,
@@ -303,6 +302,13 @@ func renderCustomCoverageHTML(outputPath string, owner *OwnerReport, fileReports
 		}
 	}
 
+	// When no source files could be resolved (repo not cloned), fall back
+	// to the owner's stats computed from the raw coverage text.
+	if totalStmts == 0 && owner.TotalStmts > 0 {
+		totalStmts = owner.TotalStmts
+		coveredStmts = owner.CoveredStmts
+	}
+
 	var overallCoverage float64
 	if totalStmts > 0 {
 		overallCoverage = float64(coveredStmts) / float64(totalStmts) * 100
@@ -326,6 +332,7 @@ func renderCustomCoverageHTML(outputPath string, owner *OwnerReport, fileReports
 		Moderate        int
 		Poor            int
 		Critical        int
+		HashGroupOwners []HashGroupOwnerInfo
 	}{
 		Owner:           owner,
 		BinaryName:      binaryName,
@@ -339,6 +346,7 @@ func renderCustomCoverageHTML(outputPath string, owner *OwnerReport, fileReports
 		Moderate:        moderate,
 		Poor:            poor,
 		Critical:        critical,
+		HashGroupOwners: owner.HashGroupOwners,
 	}
 
 	if err := tmpl.Execute(w, data); err != nil {
@@ -404,6 +412,37 @@ const customCoverageTemplate = `<!DOCTYPE html>
 
         .back-link:hover {
             text-decoration: underline;
+        }
+
+        /* Hash-group details (collapsible owner list) */
+        .hash-group-details {
+            margin-top: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 8px 12px;
+            background: #fafafa;
+        }
+        .hash-group-details summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: #667eea;
+            font-size: 13px;
+        }
+        .hash-group-table {
+            margin-top: 8px;
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .hash-group-table th,
+        .hash-group-table td {
+            padding: 4px 8px;
+            border: 1px solid #eee;
+            text-align: left;
+        }
+        .hash-group-table th {
+            background: #f0f0f0;
+            font-weight: 600;
         }
 
         /* Stat cards */
@@ -803,6 +842,13 @@ const customCoverageTemplate = `<!DOCTYPE html>
             background-color: rgba(220, 53, 69, 0.15);
         }
 
+        .no-source {
+            padding: 20px;
+            color: #888;
+            font-style: italic;
+            font-size: 13px;
+        }
+
         table.source-code td.exec-count {
             width: 1px;
             min-width: 40px;
@@ -889,8 +935,32 @@ const customCoverageTemplate = `<!DOCTYPE html>
     <div class="container" id="app">
         <div class="header">
             <a class="back-link" href="index.html">&larr; Back to Index</a>
+            {{if .HashGroupOwners}}
+            <h1>{{.BinaryName}}</h1>
+            <div class="subtitle">Combined coverage across {{len .HashGroupOwners}} owner group{{if ne (len .HashGroupOwners) 1}}s{{end}} &middot; {{.Owner.PodCount}} pod{{if ne .Owner.PodCount 1}}s{{end}} &middot; {{.TotalFiles}} source files</div>
+            <details class="hash-group-details">
+                <summary>Show all {{len .HashGroupOwners}} owner groups running this binary</summary>
+                <table class="hash-group-table">
+                    <thead><tr><th>Namespace</th><th>Type</th><th>Owner</th><th>Binary</th><th>Containers</th><th>Pods</th><th>Hosts</th></tr></thead>
+                    <tbody>
+                    {{range .HashGroupOwners}}
+                    <tr>
+                        <td>{{.Namespace}}</td>
+                        <td>{{.OwnerType}}</td>
+                        <td>{{if .OwnerName}}{{.OwnerName}}{{else}}&mdash;{{end}}</td>
+                        <td>{{.BinaryName}}</td>
+                        <td>{{.Containers}}</td>
+                        <td>{{.PodCount}}</td>
+                        <td>{{.Hosts}}</td>
+                    </tr>
+                    {{end}}
+                    </tbody>
+                </table>
+            </details>
+            {{else}}
             <h1>{{.Owner.Namespace}} / {{.Owner.OwnerType}} / {{.Owner.OwnerName}}</h1>
             <div class="subtitle">{{if .BinaryName}}Binary: {{.BinaryName}} &middot; {{end}}{{.Owner.PodCount}} pod{{if ne .Owner.PodCount 1}}s{{end}} &middot; {{.TotalFiles}} source files</div>
+            {{end}}
         </div>
 
         <div class="stats-grid">

@@ -272,6 +272,14 @@ def main():
         help=f"Directory to write the Dockerfile and machineconfigs.yaml (default: {DEFAULT_BUILD_DIR})",
     )
     parser.add_argument(
+        "--dest",
+        help=(
+            "Destination image name (e.g. quay.io/myrepo/myimage:mytag). "
+            "Overrides the default destination of "
+            f"{QUAY_REPO}:{{version}}-{{release}}."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite the image if it already exists on the remote registry",
@@ -288,7 +296,7 @@ def main():
     version, release = parse_brew_base(brew_base)
 
     # Determine image tag
-    image_tag = f"{QUAY_REPO}:{version}-{release}"
+    image_tag = args.dest or f"{QUAY_REPO}:{version}-{release}"
 
     # Show plan
     rpm_list = "\n".join(f"      - {name}-{version}-{release}.x86_64.rpm" for name in RPM_NAMES)
@@ -408,7 +416,9 @@ This script will perform the following steps:
     print("-" * 70)
     print("Step 5: Generating machineconfigs.yaml...")
     print("-" * 70)
-    image_ref = f"{QUAY_REPO}@{digest}"
+    # Use the repo portion of image_tag (strip tag) for the digest reference
+    image_repo = image_tag.rsplit(":", 1)[0] if ":" in image_tag else image_tag
+    image_ref = f"{image_repo}@{digest}"
     mc_path = os.path.join(build_dir, "machineconfigs.yaml")
     mc_content = generate_machineconfigs(image_ref)
     with open(mc_path, "w") as f:

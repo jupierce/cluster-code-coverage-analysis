@@ -27,9 +27,21 @@ var (
 	renderSkipComponentHTML  bool
 )
 
+// HashGroupOwnerInfo describes one owner contributing to a hash-group HTML report.
+type HashGroupOwnerInfo struct {
+	Namespace  string
+	OwnerType  string
+	OwnerName  string
+	BinaryName string
+	Containers string // comma-joined
+	Pods       string // comma-joined
+	PodCount   int
+	Hosts      string // comma-joined
+}
+
 type OwnerReport struct {
 	Namespace          string
-	OwnerType          string   // Deployment, DaemonSet, StatefulSet, Job, Host
+	OwnerType          string   // Deployment, DaemonSet, StatefulSet, Job, Host, Pod (No Owner)
 	OwnerName          string
 	Containers         []string // unique container/binary names
 	PodCount           int
@@ -49,6 +61,7 @@ type OwnerReport struct {
 	FirstSeen          string // earliest collected_at timestamp
 	LastSeen           string // latest collected_at timestamp
 	CommitID           string // git commit from image source labels
+	HashGroupOwners    []HashGroupOwnerInfo // populated at render time for hash-based reports
 }
 
 var renderCmd = &cobra.Command{
@@ -123,78 +136,128 @@ func runRenderE(cmd *cobra.Command, args []string) error {
 	}
 
 	if !renderSkipComponentHTML {
-		fmt.Printf("Generating HTML reports (concurrency: %d)...\n", maxConcurrency)
+		fmt.Printf("Generating HTML reports by hash group (concurrency: %d)...\n", maxConcurrency)
 
 		var successCount, cachedCount, skippedCount, errorCount int64
-		var progress atomic.Int64
 
-		// First pass: check cache (fast, serial — just reads last 128 bytes of each file)
-		type genTask struct {
-			index      int
-			mergedHash string
+		// Group owners by covmeta hash — one HTML per unique binary hash
+		type hashGroup struct {
+			hash     string
+			owners   []*OwnerReport
+			cacheKey string
 		}
-		var toGenerate []genTask
-
+		hashGroupMap := make(map[string]*hashGroup)
 		for i := range ownerReports {
-			if ownerReports[i].MergedCoverageText == "" {
+			hash := ownerReports[i].CovmetaHash
+			if hash == "" || ownerReports[i].MergedCoverageText == "" {
 				skippedCount++
 				continue
 			}
-
-			htmlFile := ownerHTMLFilename(&ownerReports[i])
-			htmlPath := filepath.Join(renderOutputDir, htmlFile)
-			mergedHash := ownerReports[i].MergeInputHash
-
-			if mergedHash != "" {
-				existingHash := extractHTMLCoverageHash(htmlPath)
-				if existingHash == mergedHash {
-					ownerReports[i].HTMLFile = htmlFile
-					ownerReports[i].HasHTML = true
-					cachedCount++
-					continue
-				}
+			hg, ok := hashGroupMap[hash]
+			if !ok {
+				hg = &hashGroup{hash: hash}
+				hashGroupMap[hash] = hg
 			}
-
-			toGenerate = append(toGenerate, genTask{index: i, mergedHash: mergedHash})
+			hg.owners = append(hg.owners, &ownerReports[i])
 		}
 
-		total := int64(len(ownerReports))
-		fmt.Printf("  %d cached, %d skipped, %d to generate\n", cachedCount, skippedCount, len(toGenerate))
+		// For hash groups with multiple owners, merge coverage stats so the
+		// index shows the combined coverage for each owner sharing the binary.
+		for _, hg := range hashGroupMap {
+			if len(hg.owners) <= 1 {
+				continue
+			}
+			var texts []string
+			for _, o := range hg.owners {
+				if o.MergedCoverageText != "" {
+					texts = append(texts, o.MergedCoverageText)
+				}
+			}
+			mergedText := mergeCoverageTexts(texts)
+			totalStmts, coveredStmts, coveragePct := parseCoverageText(mergedText)
+			for _, o := range hg.owners {
+				o.TotalStmts = totalStmts
+				o.CoveredStmts = coveredStmts
+				o.Coverage = coveragePct
+			}
+		}
 
-		// Second pass: generate HTML in parallel
+		// Check cache for each hash group
+		var toGenerate []*hashGroup
+		for _, hg := range hashGroupMap {
+			htmlFile := hg.hash + ".html"
+			htmlPath := filepath.Join(renderOutputDir, htmlFile)
+
+			// Compute combined cache key from sorted MergeInputHash values
+			var hashes []string
+			for _, o := range hg.owners {
+				hashes = append(hashes, o.MergeInputHash)
+			}
+			sort.Strings(hashes)
+			h := md5.New()
+			for _, s := range hashes {
+				io.WriteString(h, s)
+			}
+			hg.cacheKey = hex.EncodeToString(h.Sum(nil))
+
+			existingHash := extractHTMLCoverageHash(htmlPath)
+			if existingHash == hg.cacheKey {
+				for _, o := range hg.owners {
+					o.HTMLFile = htmlFile
+					o.HasHTML = true
+				}
+				cachedCount++
+				continue
+			}
+
+			toGenerate = append(toGenerate, hg)
+		}
+
+		totalGroups := int64(len(hashGroupMap))
+		fmt.Printf("  %d hash groups: %d cached, %d skipped, %d to generate\n",
+			totalGroups, cachedCount, skippedCount, len(toGenerate))
+
+		// Generate in parallel
 		sem := make(chan struct{}, maxConcurrency)
 		var wg sync.WaitGroup
+		var progress atomic.Int64
 
-		for _, task := range toGenerate {
+		for _, hg := range toGenerate {
 			wg.Add(1)
-			go func(t genTask) {
+			go func(hg *hashGroup) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				idx := t.index
-				owner := &ownerReports[idx]
+				htmlFile := hg.hash + ".html"
+				htmlPath := filepath.Join(renderOutputDir, htmlFile)
 
-				if err := generateHTMLForOwnerFromDB(clusterDir, owner, imageSources); err != nil {
+				syntheticOwner := buildSyntheticOwner(hg.owners, imageSources)
+				syntheticOwner.HTMLFile = htmlFile // pre-set so generateHTMLForOwner uses this filename
+				if err := generateHTMLForOwnerFromDB(clusterDir, syntheticOwner, imageSources); err != nil {
 					n := progress.Add(1)
-					fmt.Printf("[%d/%d] %s/%s: %v\n", n+int64(cachedCount)+int64(skippedCount), total, owner.Namespace, owner.OwnerName, err)
+					fmt.Printf("[%d/%d] %s: %v\n", n+int64(cachedCount), totalGroups, htmlFile, err)
 					atomic.AddInt64(&errorCount, 1)
 				} else {
-					if t.mergedHash != "" {
-						appendCoverageHash(filepath.Join(renderOutputDir, owner.HTMLFile), t.mergedHash)
+					appendCoverageHash(htmlPath, hg.cacheKey)
+
+					for _, o := range hg.owners {
+						o.HTMLFile = htmlFile
+						o.HasHTML = true
 					}
 					n := progress.Add(1)
 					atomic.AddInt64(&successCount, 1)
-					fmt.Printf("[%d/%d] Generated: %s\n", n+int64(cachedCount)+int64(skippedCount), total, owner.HTMLFile)
+					fmt.Printf("[%d/%d] Generated: %s (%d owner groups)\n",
+						n+int64(cachedCount), totalGroups, htmlFile, len(hg.owners))
 				}
-			}(task)
+			}(hg)
 		}
 
 		wg.Wait()
 
 		totalSuccess := successCount + cachedCount
-		fmt.Printf("\nHTML reports: %d generated, %d cached, %d errors, %d skipped (total: %d/%d)\n\n",
-			successCount, cachedCount, errorCount, skippedCount, totalSuccess, total)
+		fmt.Printf("\nHTML reports: %d generated, %d cached, %d errors, %d skipped (total: %d/%d hash groups)\n\n",
+			successCount, cachedCount, errorCount, skippedCount, totalSuccess, totalGroups)
 	}
 
 	// Generate index.html
@@ -205,6 +268,31 @@ func runRenderE(cmd *cobra.Command, args []string) error {
 
 	indexPath := filepath.Join(renderOutputDir, "index.html")
 	fmt.Printf("\nCoverage report index generated: %s\n", indexPath)
+
+	// Clean up stale HTML files no longer referenced by the index
+	validFiles := map[string]bool{"index.html": true}
+	for _, o := range ownerReports {
+		if o.HTMLFile != "" {
+			validFiles[o.HTMLFile] = true
+		}
+	}
+	entries, err := os.ReadDir(renderOutputDir)
+	if err == nil {
+		var removed int
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".html") {
+				continue
+			}
+			if !validFiles[e.Name()] {
+				os.Remove(filepath.Join(renderOutputDir, e.Name()))
+				removed++
+			}
+		}
+		if removed > 0 {
+			fmt.Printf("Cleaned up %d stale HTML files\n", removed)
+		}
+	}
+
 	fmt.Printf("\nOpen in browser:\n  xdg-open %s\n", indexPath)
 	return nil
 }
@@ -264,6 +352,109 @@ func loadOwnersForRender(db *sql.DB) ([]OwnerReport, error) {
 	return owners, rows.Err()
 }
 
+// buildSyntheticOwner creates a synthetic OwnerReport that combines all owners in a
+// hash group. The merged coverage text is the union of all owners' coverage data.
+// The resulting owner has HashGroupOwners populated for the HTML template.
+func buildSyntheticOwner(owners []*OwnerReport, imageSources map[string]imageSource) *OwnerReport {
+	// Merge all coverage texts
+	var texts []string
+	for _, o := range owners {
+		if o.MergedCoverageText != "" {
+			texts = append(texts, o.MergedCoverageText)
+		}
+	}
+	mergedText := mergeCoverageTexts(texts)
+
+	// Collect all unique values
+	podSet := make(map[string]bool)
+	containerSet := make(map[string]bool)
+	hostSet := make(map[string]bool)
+	binaryName := ""
+	for _, o := range owners {
+		for _, p := range o.Pods {
+			podSet[p] = true
+		}
+		for _, c := range o.Containers {
+			containerSet[c] = true
+		}
+		for _, h := range o.Hosts {
+			hostSet[h] = true
+		}
+		if binaryName == "" && o.BinaryName != "" {
+			binaryName = o.BinaryName
+		}
+	}
+
+	pods := make([]string, 0, len(podSet))
+	for p := range podSet {
+		pods = append(pods, p)
+	}
+	sort.Strings(pods)
+
+	containers := make([]string, 0, len(containerSet))
+	for c := range containerSet {
+		containers = append(containers, c)
+	}
+	sort.Strings(containers)
+
+	hosts := make([]string, 0, len(hostSet))
+	for h := range hostSet {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+
+	// Pick the best image for source resolution
+	bestImage := ""
+	for _, o := range owners {
+		if o.Image == "" {
+			continue
+		}
+		if bestImage == "" {
+			bestImage = o.Image
+		}
+		// Prefer an image with a resolved source repo
+		if src, ok := imageSources[o.Image]; ok && src.SourceRepo != "" {
+			bestImage = o.Image
+			break
+		}
+	}
+
+	// Compute total stmts from merged text (not sum of individual owners)
+	totalStmts, coveredStmts, coveragePct := parseCoverageText(mergedText)
+
+	// Build hash group owner info for the collapsible details section
+	hashGroupOwners := make([]HashGroupOwnerInfo, 0, len(owners))
+	for _, o := range owners {
+		hashGroupOwners = append(hashGroupOwners, HashGroupOwnerInfo{
+			Namespace:  o.Namespace,
+			OwnerType:  o.OwnerType,
+			OwnerName:  o.OwnerName,
+			BinaryName: o.BinaryName,
+			Containers: strings.Join(o.Containers, ", "),
+			Pods:       strings.Join(o.Pods, ", "),
+			PodCount:   o.PodCount,
+			Hosts:      strings.Join(o.Hosts, ", "),
+		})
+	}
+
+	return &OwnerReport{
+		Namespace:          owners[0].Namespace,
+		OwnerType:          owners[0].OwnerType,
+		OwnerName:          owners[0].OwnerName,
+		Containers:         containers,
+		PodCount:           len(pods),
+		Pods:               pods,
+		Hosts:              hosts,
+		Coverage:           coveragePct,
+		TotalStmts:         totalStmts,
+		CoveredStmts:       coveredStmts,
+		Image:              bestImage,
+		MergedCoverageText: mergedText,
+		BinaryName:         binaryName,
+		HashGroupOwners:    hashGroupOwners,
+	}
+}
+
 // generateHTMLForOwnerFromDB writes the merged coverage text from DB to a temp file,
 // then runs the existing HTML generation pipeline.
 func generateHTMLForOwnerFromDB(clusterDir string, owner *OwnerReport, imageSources map[string]imageSource) error {
@@ -301,9 +492,36 @@ func generateHTMLForOwner(clusterDir string, owner *OwnerReport, imageSources ma
 	// Strategy 1: Find repo via image source labels (fast, O(1))
 	if owner.Image != "" {
 		if src, ok := imageSources[owner.Image]; ok {
-			repoPath = findRepoByImageSource(reposDir, src)
-			if repoPath != "" {
-				fmt.Printf("  Found repo via image labels: %s\n", src.SourceRepo)
+			candidate := findRepoByImageSource(reposDir, src)
+			if candidate != "" {
+				// Validate: does the repo's module match the coverage package path?
+				// Images can contain multiple binaries from different repos, so the
+				// image label may point to the wrong repo for this binary.
+				if packagePath != "" {
+					modName := getModuleName(candidate)
+					if modName != "" && !strings.HasPrefix(packagePath, modName) {
+						// Check workspace modules too
+						wsMods := parseGoWorkModules(candidate)
+						matched := false
+						if wsMods != nil {
+							for mod := range wsMods {
+								if strings.HasPrefix(packagePath, mod) {
+									matched = true
+									break
+								}
+							}
+						}
+						if !matched {
+							fmt.Printf("  Image label repo %s (module %s) doesn't match package %s, trying other strategies\n",
+								src.SourceRepo, modName, packagePath)
+							candidate = ""
+						}
+					}
+				}
+				if candidate != "" {
+					repoPath = candidate
+					fmt.Printf("  Found repo via image labels: %s\n", src.SourceRepo)
+				}
 			}
 		}
 	}
@@ -382,17 +600,12 @@ func generateHTMLForOwner(clusterDir string, owner *OwnerReport, imageSources ma
 		fmt.Printf("  go.work detected with %d workspace modules\n", len(workspaceModules))
 	}
 
-	// Filter out coverage lines for source files that don't exist in the repo
-	if filteredFile, wasFiltered := filterMissingSourceFiles(covFileToUse, repoPath, workspaceModules); wasFiltered {
-		if covFileToUse != owner.MergedCovFile {
-			os.Remove(covFileToUse)
-		}
-		covFileToUse = filteredFile
-		defer os.Remove(filteredFile)
-	}
-
 	// Generate custom HTML report
-	htmlFile := ownerHTMLFilename(owner)
+	// Use pre-set HTMLFile (e.g. hash-based name) if available, else compute from owner info
+	htmlFile := owner.HTMLFile
+	if htmlFile == "" {
+		htmlFile = ownerHTMLFilename(owner)
+	}
 
 	absOutputDir, err := filepath.Abs(renderOutputDir)
 	if err != nil {
@@ -908,77 +1121,6 @@ func rewriteCoveragePaths(coverageFile, oldPath, newPath string) (string, error)
 	return tmpFile.Name(), nil
 }
 
-func filterMissingSourceFiles(coverageFile, repoPath string, workspaceModules map[string]string) (string, bool) {
-	data, err := os.ReadFile(coverageFile)
-	if err != nil {
-		return coverageFile, false
-	}
-
-	lines := strings.Split(string(data), "\n")
-	var filtered []string
-	removedCount := 0
-	moduleName := getModuleName(repoPath)
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, "mode:") || line == "" {
-			filtered = append(filtered, line)
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) < 1 {
-			filtered = append(filtered, line)
-			continue
-		}
-
-		fileAndLine := parts[0]
-		idx := strings.Index(fileAndLine, ":")
-		if idx <= 0 {
-			filtered = append(filtered, line)
-			continue
-		}
-
-		filePath := fileAndLine[:idx]
-
-		relPath := filePath
-		if workspaceModules != nil {
-			if resolved := resolveWorkspacePath(filePath, workspaceModules); resolved != "" {
-				relPath = resolved
-			}
-		} else if moduleName != "" && strings.HasPrefix(filePath, moduleName) {
-			relPath = strings.TrimPrefix(filePath, moduleName)
-			relPath = strings.TrimPrefix(relPath, "/")
-		}
-
-		absPath := filepath.Join(repoPath, relPath)
-		if _, err := os.Stat(absPath); os.IsNotExist(err) {
-			removedCount++
-			continue
-		}
-
-		filtered = append(filtered, line)
-	}
-
-	if removedCount == 0 {
-		return coverageFile, false
-	}
-
-	tmpFile, err := os.CreateTemp("", "coverage-filtered-*.out")
-	if err != nil {
-		return coverageFile, false
-	}
-
-	content := strings.Join(filtered, "\n")
-	if _, err := tmpFile.WriteString(content); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
-		return coverageFile, false
-	}
-	tmpFile.Close()
-
-	return tmpFile.Name(), true
-}
-
 func findRepoByOwnerName(reposDir, ownerName string) string {
 	var bestMatch string
 	bestScore := 0
@@ -1119,10 +1261,12 @@ func calculateOwnerStats(owners []OwnerReport) OwnerStats {
 		ByType:      make(map[string]int),
 	}
 
+	// Deduplicate statement counts by covmeta hash so binaries shared
+	// across multiple owners are counted only once in the overall total.
+	seenHash := make(map[string]bool)
+
 	for _, o := range owners {
 		stats.TotalPods += o.PodCount
-		stats.TotalStmts += o.TotalStmts
-		stats.CoveredStmts += o.CoveredStmts
 		stats.ByType[o.OwnerType]++
 
 		if o.HasHTML {
@@ -1140,6 +1284,16 @@ func calculateOwnerStats(owners []OwnerReport) OwnerStats {
 		} else {
 			stats.Critical++
 		}
+
+		// Only count stmts once per unique binary hash
+		if o.CovmetaHash != "" && seenHash[o.CovmetaHash] {
+			continue
+		}
+		if o.CovmetaHash != "" {
+			seenHash[o.CovmetaHash] = true
+		}
+		stats.TotalStmts += o.TotalStmts
+		stats.CoveredStmts += o.CoveredStmts
 	}
 
 	if stats.TotalStmts > 0 {
@@ -1375,6 +1529,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         .owner-type.DaemonSet { background: #fff3cd; color: #856404; }
         .owner-type.Job { background: #f8d7da; color: #721c24; }
         .owner-type.Pod { background: #e2e3e5; color: #383d41; }
+        .owner-type.pod-no-owner { background: #e2e3e5; color: #383d41; }
         .owner-type.Host { background: #fff3cd; color: #856404; }
         .namespace.na { background: #fff3cd; color: #856404; }
 
@@ -1649,6 +1804,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 <option value="StatefulSet">StatefulSets</option>
                 <option value="Job">Jobs</option>
                 <option value="Pod">Pods</option>
+                <option value="Pod (No Owner)">Pods (No Owner)</option>
                 <option value="Host">Host</option>
             </select>
             <select id="coverageFilter">
@@ -1664,6 +1820,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         <div class="checkbox-filters">
             <label><input type="checkbox" id="hideTestBinaries" checked> Hide openshift-tests entries</label>
             <label><input type="checkbox" id="hideE2eNamespaces" checked> Hide e2e-* namespace entries</label>
+            <label><input type="checkbox" id="hideMustGatherNamespaces" checked> Hide openshift-must-gather-* namespace entries</label>
         </div>
 
         <div id="filterInfo" class="filter-info"></div>
@@ -1697,8 +1854,8 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                     class="owner-row">
                     <td>{{if ne .OwnerType "Host"}}<span class="namespace{{if eq .Namespace "host"}} na{{end}}">{{.Namespace}}</span>{{end}}</td>
                     <td>
-                        <span class="owner-type {{.OwnerType}}">{{.OwnerType}}</span>
-                        {{if ne .OwnerType "Host"}}<strong>{{.OwnerName}}</strong>{{end}}
+                        <span class="owner-type {{if eq .OwnerType "Pod (No Owner)"}}pod-no-owner{{else}}{{.OwnerType}}{{end}}">{{.OwnerType}}</span>
+                        {{if and (ne .OwnerType "Host") (ne .OwnerType "Pod (No Owner)")}}<strong>{{.OwnerName}}</strong>{{end}}
                     </td>
                     <td class="container-cell">
                         {{if eq .OwnerType "Host"}}<code class="containers">/ {{.BinaryName}}</code>
@@ -1760,6 +1917,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         const coverageFilter = document.getElementById('coverageFilter');
         const hideTestBinaries = document.getElementById('hideTestBinaries');
         const hideE2eNamespaces = document.getElementById('hideE2eNamespaces');
+        const hideMustGatherNamespaces = document.getElementById('hideMustGatherNamespaces');
         const filterInfo = document.getElementById('filterInfo');
         const table = document.getElementById('ownersTable');
         const rows = table.querySelectorAll('tbody tr.owner-row');
@@ -1773,24 +1931,24 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         }
 
         function updateStats() {
-            let owners = 0, totalStmts = 0, coveredStmts = 0;
+            let owners = 0;
             let excellent = 0, good = 0, moderate = 0, poor = 0, critical = 0;
             const seenHashes = new Set();
-            let uniqueStmts = 0;
+            let uniqueStmts = 0, uniqueCovered = 0;
 
             rows.forEach(row => {
                 if (row.style.display === 'none') return;
                 owners++;
-                totalStmts += parseInt(row.dataset.statements) || 0;
-                coveredStmts += parseInt(row.dataset.coveredStmts) || 0;
 
-                // Deduplicate total statements by covmeta hash
+                // Deduplicate by covmeta hash for overall stats
                 const hash = row.dataset.covmetaHash;
                 if (hash && !seenHashes.has(hash)) {
                     seenHashes.add(hash);
                     uniqueStmts += parseInt(row.dataset.statements) || 0;
+                    uniqueCovered += parseInt(row.dataset.coveredStmts) || 0;
                 } else if (!hash) {
                     uniqueStmts += parseInt(row.dataset.statements) || 0;
+                    uniqueCovered += parseInt(row.dataset.coveredStmts) || 0;
                 }
 
                 const cls = row.dataset.coverageClass;
@@ -1801,7 +1959,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 else critical++;
             });
 
-            const pct = totalStmts > 0 ? (coveredStmts / totalStmts * 100) : 0;
+            const pct = uniqueStmts > 0 ? (uniqueCovered / uniqueStmts * 100) : 0;
             document.getElementById('statOwners').textContent = owners.toLocaleString();
             document.getElementById('statCoverage').textContent = pct.toFixed(1) + '%';
             document.getElementById('statStmts').textContent = uniqueStmts.toLocaleString();
@@ -1819,9 +1977,10 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             const selectedCoverage = coverageFilter.value;
             const hideTests = hideTestBinaries.checked;
             const hideE2e = hideE2eNamespaces.checked;
+            const hideMustGather = hideMustGatherNamespaces.checked;
 
             let visibleCount = 0;
-            let anyFilter = searchTerm || selectedNamespace || selectedOwnerType || selectedCoverage || hideTests || hideE2e;
+            let anyFilter = searchTerm || selectedNamespace || selectedOwnerType || selectedCoverage || hideTests || hideE2e || hideMustGather;
 
             rows.forEach(row => {
                 const namespace = row.dataset.namespace;
@@ -1853,7 +2012,10 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 const matchesE2eFilter = !hideE2e ||
                     !namespace.startsWith('e2e-');
 
-                if (matchesSearch && matchesNamespace && matchesOwnerType && matchesCoverage && matchesTestFilter && matchesE2eFilter) {
+                const matchesMustGatherFilter = !hideMustGather ||
+                    !namespace.startsWith('openshift-must-gather-');
+
+                if (matchesSearch && matchesNamespace && matchesOwnerType && matchesCoverage && matchesTestFilter && matchesE2eFilter && matchesMustGatherFilter) {
                     row.style.display = '';
                     visibleCount++;
                 } else {
@@ -1883,6 +2045,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         coverageFilter.addEventListener('change', applyFilters);
         hideTestBinaries.addEventListener('change', applyFilters);
         hideE2eNamespaces.addEventListener('change', applyFilters);
+        hideMustGatherNamespaces.addEventListener('change', applyFilters);
 
         // Cache each owner row's details row reference
         rows.forEach(row => {

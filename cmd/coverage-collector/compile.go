@@ -452,7 +452,7 @@ func extractOwnerInfoCompile(podName string) (ownerType, ownerName string) {
 		return "DaemonSet", match[1]
 	}
 
-	return "Pod", podName
+	return "Pod (No Owner)", ""
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +582,113 @@ func computePerFileStats(text string) []fileStats {
 	})
 
 	return result
+}
+
+// ---------------------------------------------------------------------------
+// Image source from info.json
+// ---------------------------------------------------------------------------
+
+// populateImageSourcesFromInfoJSON scans report directories for info.json files
+// and extracts source_url/source_commit fields. These are inserted into the
+// image_sources table with priority over image label inspection.
+//
+// For container reports, the image field is used as the key in image_sources.
+// For host reports (no image), a synthetic key "host:<binary_name>" is used
+// so that the render step can look up source info for host-type owners.
+func populateImageSourcesFromInfoJSON(db *sql.DB, coverageDir string) error {
+	// Find report sources that don't yet have a resolved source_repo.
+	// Include host reports (which have no image) by using a synthetic key.
+	rows, err := db.Query(`
+		SELECT rs.image, rs.dir_name, rs.is_host, rs.binary_name FROM report_sources rs
+		WHERE rs.dir_name NOT IN (
+		    SELECT dir_name FROM report_sources rs2
+		    WHERE rs2.image != '' AND rs2.image IN (
+		        SELECT image FROM image_sources WHERE source_repo != '' AND error_msg = ''
+		    )
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type imageDir struct {
+		image      string
+		dirName    string
+		isHost     bool
+		binaryName string
+	}
+	var candidates []imageDir
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var id imageDir
+		var isHostInt int
+		rows.Scan(&id.image, &id.dirName, &isHostInt, &id.binaryName)
+		id.isHost = isHostInt != 0
+		// Deduplicate: for container images, by image; for hosts, by binary name
+		key := id.image
+		if id.isHost || id.image == "" {
+			key = "host:" + id.binaryName
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		candidates = append(candidates, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	resolved := 0
+	for _, c := range candidates {
+		infoPath := filepath.Join(coverageDir, c.dirName, "info.json")
+		data, err := os.ReadFile(infoPath)
+		if err != nil {
+			continue
+		}
+
+		var info map[string]interface{}
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+
+		// info.json uses "source_url" for the repo URL
+		sourceRepo, _ := info["source_url"].(string)
+		sourceCommit, _ := info["source_commit"].(string)
+		if sourceRepo == "" {
+			continue
+		}
+
+		// For host reports, use a synthetic image key so render can look it up
+		imageKey := c.image
+		if c.isHost || c.image == "" {
+			imageKey = "host:" + c.binaryName
+		}
+
+		db.Exec(`
+			INSERT INTO image_sources (image, source_repo, commit_id, inspected_at, error_msg)
+			VALUES (?, ?, ?, datetime('now'), '')
+			ON CONFLICT(image) DO UPDATE SET
+				source_repo = excluded.source_repo,
+				commit_id = excluded.commit_id,
+				inspected_at = excluded.inspected_at,
+				error_msg = ''
+		`, imageKey, sourceRepo, sourceCommit)
+
+		fmt.Printf("  info.json: %s → %s @ %s\n", imageKey, sourceRepo, truncateCommit(sourceCommit))
+		resolved++
+	}
+
+	if resolved > 0 {
+		fmt.Printf("  Resolved %d source(s) from info.json\n", resolved)
+	}
+
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +893,35 @@ func inspectImages(db *sql.DB) error {
 	return nil
 }
 
+// selectOwnerImage picks the best image from a set for source resolution.
+// It prefers an image that already has a resolved source_repo in image_sources.
+// Falls back to the first image alphabetically for determinism.
+func selectOwnerImage(db *sql.DB, images map[string]bool) string {
+	if len(images) == 0 {
+		return ""
+	}
+
+	sorted := make([]string, 0, len(images))
+	for img := range images {
+		sorted = append(sorted, img)
+	}
+	sort.Strings(sorted)
+
+	// Prefer an image with a resolved source repo
+	for _, img := range sorted {
+		var count int
+		err := db.QueryRow(
+			"SELECT COUNT(*) FROM image_sources WHERE image = ? AND source_repo != '' AND error_msg = ''",
+			img,
+		).Scan(&count)
+		if err == nil && count > 0 {
+			return img
+		}
+	}
+
+	return sorted[0]
+}
+
 // findOwnersForImage returns the distinct owner_name values for owners
 // that use the given image. Used to resolve release payload components.
 func findOwnersForImage(db *sql.DB, image string) []string {
@@ -898,8 +1034,11 @@ func runCompile(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ingest reports: %w", err)
 	}
 
-	// Phase 1.5: Inspect images for source repo labels
-	fmt.Println("\nPhase 1.5: Inspecting images...")
+	// Phase 1.5: Resolve image sources from info.json first, then inspect remaining
+	fmt.Println("\nPhase 1.5: Resolving image sources...")
+	if err := populateImageSourcesFromInfoJSON(db, coverageDir); err != nil {
+		fmt.Printf("Warning: info.json source resolution failed: %v\n", err)
+	}
 	if err := inspectImages(db); err != nil {
 		fmt.Printf("Warning: image inspection failed: %v\n", err)
 	}
@@ -1145,14 +1284,15 @@ func computeOwners(db *sql.DB, changedDirs map[string]bool, filters []updateFilt
 	}
 	reports = dedupedReports
 
-	// Group by owner
+	// Group by owner — uses covmeta hash instead of image so that the same
+	// binary from different container images is merged into a single owner.
 	type ownerGroup struct {
 		Namespace  string
 		OwnerType  string
 		OwnerName  string
 		BinaryName string
-		Image      string
-		GroupKey    string
+		Images     map[string]bool // all distinct images in the group
+		GroupKey   string
 		Pods       map[string]bool
 		Containers map[string]bool
 		Hosts      map[string]bool
@@ -1181,7 +1321,10 @@ func computeOwners(db *sql.DB, changedDirs map[string]bool, filters []updateFilt
 			}
 		}
 
-		groupKey := fmt.Sprintf("%s/%s/%s/%s/%s", namespace, ownerType, ownerName, binaryName, r.Image)
+		// Use covmeta hash (binary's statement structure) instead of image
+		// so that the same binary packaged in different images is merged.
+		covHash := computeCovmetaHash(r.CoverageText)
+		groupKey := fmt.Sprintf("%s/%s/%s/%s/%s", namespace, ownerType, ownerName, binaryName, covHash)
 
 		og, exists := ownerMap[groupKey]
 		if !exists {
@@ -1190,13 +1333,18 @@ func computeOwners(db *sql.DB, changedDirs map[string]bool, filters []updateFilt
 				OwnerType:  ownerType,
 				OwnerName:  ownerName,
 				BinaryName: binaryName,
-				Image:      r.Image,
+				Images:     make(map[string]bool),
 				GroupKey:    groupKey,
 				Pods:       make(map[string]bool),
 				Containers: make(map[string]bool),
 				Hosts:      make(map[string]bool),
 			}
 			ownerMap[groupKey] = og
+		}
+		if r.Image != "" {
+			og.Images[r.Image] = true
+		} else if r.IsHost && binaryName != "" {
+			og.Images["host:"+binaryName] = true
 		}
 		if r.PodName != "" {
 			og.Pods[r.PodName] = true
@@ -1309,8 +1457,10 @@ func computeOwners(db *sql.DB, changedDirs map[string]bool, filters []updateFilt
 		sort.Strings(hosts)
 		hostsJSON, _ := json.Marshal(hosts)
 
-		// Image comes from the group (all reports in group share the same image)
-		ownerImage := og.Image
+		// Pick the best image for source resolution: prefer one that already
+		// has a resolved source_repo in image_sources; otherwise use the first
+		// image alphabetically for determinism.
+		ownerImage := selectOwnerImage(db, og.Images)
 
 		// Compute first_seen and last_seen from collected_at timestamps
 		firstSeen := ""
