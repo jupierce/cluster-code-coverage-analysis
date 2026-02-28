@@ -61,6 +61,7 @@ type OwnerReport struct {
 	FirstSeen          string // earliest collected_at timestamp
 	LastSeen           string // latest collected_at timestamp
 	CommitID           string // git commit from image source labels
+	SourceRepo         string // source repository URL from image_sources table
 	HashGroupOwners    []HashGroupOwnerInfo // populated at render time for hash-based reports
 }
 
@@ -130,6 +131,7 @@ func runRenderE(cmd *cobra.Command, args []string) error {
 		if ownerReports[i].Image != "" {
 			if src, ok := imageSources[ownerReports[i].Image]; ok {
 				ownerReports[i].CommitID = src.CommitID
+				ownerReports[i].SourceRepo = src.SourceRepo
 			}
 		}
 		ownerReports[i].CovmetaHash = computeCovmetaHash(ownerReports[i].MergedCoverageText)
@@ -1207,6 +1209,11 @@ func generateOwnerIndexHTML(outputDir string, owners []OwnerReport) error {
 			}
 			return commitID
 		},
+		"stripHTTPS": func(url string) string {
+			url = strings.TrimPrefix(url, "https://")
+			url = strings.TrimPrefix(url, "http://")
+			return url
+		},
 		"formatInt": func(n int) string {
 			s := fmt.Sprintf("%d", n)
 			if len(s) <= 3 {
@@ -1454,6 +1461,99 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             font-size: 14px;
             background: white;
             cursor: pointer;
+        }
+
+        .multi-select {
+            position: relative;
+            flex: 1;
+            min-width: 250px;
+        }
+
+        .multi-select-trigger {
+            width: 100%;
+            padding: 10px 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            background: white;
+            cursor: pointer;
+            white-space: nowrap;
+            text-align: left;
+            box-sizing: border-box;
+        }
+
+        .multi-select-trigger:hover {
+            border-color: #aaa;
+        }
+
+        .multi-select-trigger::after {
+            content: ' \25BE';
+            float: right;
+            margin-left: 8px;
+        }
+
+        .multi-select-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            z-index: 1000;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            min-width: 320px;
+            max-width: 450px;
+            margin-top: 4px;
+        }
+
+        .multi-select-search {
+            width: 100%;
+            padding: 8px 12px;
+            border: none;
+            border-bottom: 1px solid #eee;
+            font-size: 13px;
+            outline: none;
+            box-sizing: border-box;
+        }
+
+        .multi-select-search:focus {
+            border-bottom-color: #667eea;
+        }
+
+        .multi-select-options {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .multi-select-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .multi-select-option:hover {
+            background: #f0f4ff;
+        }
+
+        .multi-select-option.all-option {
+            border-bottom: 1px solid #eee;
+            font-weight: 600;
+        }
+
+        .multi-select-option input[type="checkbox"] {
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+
+        .multi-select-option label {
+            cursor: pointer;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         table {
@@ -1793,6 +1893,16 @@ const ownerIndexTemplate = `<!DOCTYPE html>
         </div>
 
         <div class="controls">
+            <div class="multi-select" id="sourceRepoMultiSelect">
+                <button type="button" class="multi-select-trigger" id="sourceRepoTrigger">All Source Repos</button>
+                <div class="multi-select-dropdown" id="sourceRepoDropdown" style="display:none">
+                    <input type="text" class="multi-select-search" id="sourceRepoSearch" placeholder="Filter repos...">
+                    <div class="multi-select-options" id="sourceRepoOptions"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="controls">
             <div class="search-box">
                 <input type="text" id="searchBox" placeholder="Search namespace or owner name...">
             </div>
@@ -1852,6 +1962,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                     data-image="{{.Image}}"
                     data-covmeta-hash="{{.CovmetaHash}}"
                     data-coverage-class="{{colorClass .Coverage}}"
+                    data-source-repo="{{stripHTTPS .SourceRepo}}"
                     data-first-seen="{{.FirstSeen}}"
                     class="owner-row">
                     <td>{{if ne .OwnerType "Host"}}<span class="namespace{{if eq .Namespace "host"}} na{{end}}">{{.Namespace}}</span>{{end}}</td>
@@ -1911,6 +2022,100 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             option.value = ns;
             option.textContent = ns;
             namespaceFilter.appendChild(option);
+        });
+
+        // Populate source repo multi-select
+        const sourceRepoOptions = document.getElementById('sourceRepoOptions');
+        const sourceRepoTrigger = document.getElementById('sourceRepoTrigger');
+        const sourceRepoDropdown = document.getElementById('sourceRepoDropdown');
+        const sourceRepoSearch = document.getElementById('sourceRepoSearch');
+        const sourceRepos = new Set();
+        document.querySelectorAll('tr[data-source-repo]').forEach(row => {
+            if (row.dataset.sourceRepo) sourceRepos.add(row.dataset.sourceRepo);
+        });
+
+        // Create "All (*)" option
+        const allDiv = document.createElement('div');
+        allDiv.className = 'multi-select-option all-option';
+        const allCb = document.createElement('input');
+        allCb.type = 'checkbox';
+        allCb.id = 'sourceRepoAll';
+        allCb.checked = true;
+        const allLabel = document.createElement('label');
+        allLabel.htmlFor = 'sourceRepoAll';
+        allLabel.textContent = 'All (*)';
+        allDiv.appendChild(allCb);
+        allDiv.appendChild(allLabel);
+        sourceRepoOptions.appendChild(allDiv);
+
+        // Create per-repo options
+        [...sourceRepos].sort().forEach(repo => {
+            const div = document.createElement('div');
+            div.className = 'multi-select-option';
+            div.dataset.repo = repo.toLowerCase();
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = repo;
+            cb.className = 'source-repo-cb';
+            const lbl = document.createElement('label');
+            lbl.textContent = repo;
+            div.appendChild(cb);
+            div.appendChild(lbl);
+            sourceRepoOptions.appendChild(div);
+        });
+
+        function updateSourceRepoTrigger() {
+            if (allCb.checked) {
+                sourceRepoTrigger.textContent = 'All Source Repos';
+                return;
+            }
+            const checked = document.querySelectorAll('.source-repo-cb:checked');
+            if (checked.length === 0) {
+                sourceRepoTrigger.textContent = 'No repos selected';
+            } else if (checked.length === 1) {
+                sourceRepoTrigger.textContent = '1 repo selected';
+            } else {
+                sourceRepoTrigger.textContent = checked.length + ' repos selected';
+            }
+        }
+
+        // "All" checkbox behavior
+        allCb.addEventListener('change', () => {
+            document.querySelectorAll('.source-repo-cb').forEach(cb => { cb.checked = false; });
+            updateSourceRepoTrigger();
+            applyFilters();
+        });
+
+        // Individual repo checkbox behavior
+        sourceRepoOptions.addEventListener('change', (e) => {
+            if (e.target.classList.contains('source-repo-cb')) {
+                allCb.checked = false;
+                updateSourceRepoTrigger();
+                applyFilters();
+            }
+        });
+
+        // Search filter for repo list
+        sourceRepoSearch.addEventListener('input', () => {
+            const term = sourceRepoSearch.value.toLowerCase();
+            document.querySelectorAll('.multi-select-option:not(.all-option)').forEach(div => {
+                div.style.display = div.dataset.repo.includes(term) ? '' : 'none';
+            });
+        });
+
+        // Toggle dropdown
+        sourceRepoTrigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const visible = sourceRepoDropdown.style.display !== 'none';
+            sourceRepoDropdown.style.display = visible ? 'none' : '';
+            if (!visible) sourceRepoSearch.focus();
+        });
+
+        // Close dropdown on outside click
+        document.addEventListener('click', (e) => {
+            if (!document.getElementById('sourceRepoMultiSelect').contains(e.target)) {
+                sourceRepoDropdown.style.display = 'none';
+            }
         });
 
         // Filter functionality
@@ -1981,8 +2186,17 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             const hideE2e = hideE2eNamespaces.checked;
             const hideMustGather = hideMustGatherNamespaces.checked;
 
+            // Source repo multi-select state
+            const repoAllChecked = allCb.checked;
+            const selectedRepos = new Set();
+            if (!repoAllChecked) {
+                document.querySelectorAll('.source-repo-cb:checked').forEach(cb => {
+                    selectedRepos.add(cb.value);
+                });
+            }
+
             let visibleCount = 0;
-            let anyFilter = searchTerm || selectedNamespace || selectedOwnerType || selectedCoverage || hideTests || hideE2e || hideMustGather;
+            let anyFilter = searchTerm || selectedNamespace || selectedOwnerType || selectedCoverage || hideTests || hideE2e || hideMustGather || !repoAllChecked;
 
             rows.forEach(row => {
                 const namespace = row.dataset.namespace;
@@ -1992,6 +2206,7 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 const binary = row.dataset.binary.toLowerCase();
                 const ownerType = row.dataset.ownerType;
                 const coverageClass = row.dataset.coverageClass;
+                const sourceRepo = row.dataset.sourceRepo;
 
                 const matchesSearch = !searchTerm ||
                     namespaceLower.includes(searchTerm) ||
@@ -2017,7 +2232,10 @@ const ownerIndexTemplate = `<!DOCTYPE html>
                 const matchesMustGatherFilter = !hideMustGather ||
                     !namespace.startsWith('openshift-must-gather-');
 
-                if (matchesSearch && matchesNamespace && matchesOwnerType && matchesCoverage && matchesTestFilter && matchesE2eFilter && matchesMustGatherFilter) {
+                const matchesSourceRepo = repoAllChecked ||
+                    selectedRepos.has(sourceRepo);
+
+                if (matchesSearch && matchesNamespace && matchesOwnerType && matchesCoverage && matchesTestFilter && matchesE2eFilter && matchesMustGatherFilter && matchesSourceRepo) {
                     row.style.display = '';
                     visibleCount++;
                 } else {
@@ -2033,7 +2251,19 @@ const ownerIndexTemplate = `<!DOCTYPE html>
             // Update filter info
             if (anyFilter) {
                 filterInfo.classList.add('active');
-                filterInfo.textContent = 'Showing ' + visibleCount + ' of ' + rows.length + ' owners';
+                let repoMatchCount = rows.length;
+                if (!repoAllChecked) {
+                    repoMatchCount = 0;
+                    rows.forEach(row => {
+                        if (selectedRepos.has(row.dataset.sourceRepo)) repoMatchCount++;
+                    });
+                }
+                const hiddenCount = repoMatchCount - visibleCount;
+                if (!repoAllChecked) {
+                    filterInfo.textContent = 'Showing ' + visibleCount + ' of ' + repoMatchCount + ' owners for selected source repos (' + hiddenCount + ' hidden)';
+                } else {
+                    filterInfo.textContent = 'Showing ' + visibleCount + ' of ' + rows.length + ' owners (' + hiddenCount + ' hidden)';
+                }
             } else {
                 filterInfo.classList.remove('active');
             }
