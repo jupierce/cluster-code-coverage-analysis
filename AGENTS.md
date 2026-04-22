@@ -8,10 +8,11 @@ during cluster operation (integration/E2E testing, steady-state runtime, etc.).
 ## Workflow
 
 ```
-coverage-collector cluster download      # Download coverage data from S3
-coverage-collector cluster compile       # Process into SQLite database
-coverage-collector cluster clone-sources # Clone source repos for HTML annotation
-coverage-collector cluster render        # Generate HTML reports from database
+coverage-collector cluster download       # Download coverage data from S3
+coverage-collector cluster compile        # Process into SQLite database
+coverage-collector cluster clone-sources  # Clone source repos for HTML annotation
+coverage-collector cluster render         # Generate HTML reports from database
+coverage-collector cluster codecov-upload # Upload coverage to Codecov
 ```
 
 Each step is incremental: hash-based change detection skips unchanged data.
@@ -28,6 +29,7 @@ cmd/coverage-collector/
   render.go            # HTML report generation (hash-group based), index.html template
   render_custom_html.go # Per-file source annotation HTML renderer + template
   bigquery.go          # BigQuery command group + ingest subcommand
+  codecov.go           # Codecov upload subcommand (shells out to codecov CLI)
 pkg/
   log/                 # Logger package
 reports/               # Collection data directories (gitignored)
@@ -44,6 +46,10 @@ go build ./cmd/coverage-collector/
 ./coverage-collector cluster compile --collection <name> [--update '*']
 ./coverage-collector cluster clone-sources --collection <name>
 ./coverage-collector cluster render --collection <name>
+
+# Upload to Codecov (after compile + clone-sources)
+./coverage-collector cluster codecov-upload --collection <name> \
+  --codecov-token $CODECOV_TOKEN [--flag openshift-e2e] [--codecov-url <url>]
 ```
 
 ## Dependencies
@@ -56,6 +62,7 @@ go build ./cmd/coverage-collector/
 - `github.com/spf13/cobra` (CLI framework)
 - `modernc.org/sqlite` (pure Go SQLite driver, no CGo)
 - `cloud.google.com/go/bigquery` (BigQuery client for ingest)
+- `codecov` CLI (for codecov-upload; auto-downloaded if not on PATH)
 
 ## Database Schema (v5)
 
@@ -384,6 +391,73 @@ Partitioned by `ingestion_time`, clustered by
 
 Uses Application Default Credentials (ADC). User must run
 `gcloud auth application-default login` or set `GOOGLE_APPLICATION_CREDENTIALS`.
+
+## Codecov Upload (`codecov.go`)
+
+Uploads merged coverage data from the SQLite database to Codecov. Groups
+coverage by `(source_repo, commit_id)` so each Codecov upload targets one
+repository at one commit — matching Codecov's per-repo-per-commit model.
+
+```
+coverage-collector cluster codecov-upload --collection <name> \
+    [--codecov-token <token>] [--flag openshift-e2e] \
+    [--codecov-url <url>] [--namespace <glob>...] [--owner <glob>...]
+```
+
+### Flags
+
+- `--codecov-token`: Upload token (or `CODECOV_TOKEN` env). Org-level tokens
+  work for all repos in the org on both public codecov.io and self-hosted.
+- `--flag`: Codecov flags (repeatable, default `openshift-e2e`). Used by
+  Codecov/DevLake to distinguish E2E coverage from unit test coverage.
+- `--codecov-url`: Self-hosted Codecov instance URL (sets `CODECOV_URL` env
+  for the CLI process).
+- `--namespace` / `--owner`: Glob filters (same OR/AND logic as BigQuery ingest).
+- `--dry-run`: Show what would be uploaded without executing.
+
+### Upload Flow
+
+1. Open SQLite DB read-only
+2. Load owners via `loadOwnersForRender()`, filter by `--namespace`/`--owner`
+3. Group by covmeta hash (dedup same binary across pods)
+4. Resolve `(source_repo, commit_id)` per hash group from `image_sources`
+5. Re-group hash groups by `(source_repo, commit_id)` — all binaries from
+   the same repo merge into a single upload
+6. For each repo+commit group:
+   - Merge all coverage texts via `mergeCoverageTexts()`
+   - Rewrite paths (strip module prefix, `/workspace/`, `/go/src/`, handle
+     `go.work` workspace modules) so Codecov maps to repo-relative files
+   - Write Go cover profile to temp file
+   - Shell out to `codecov upload-coverage` with `--sha`, `--slug`,
+     `--git-service`, `--flag`, `--disable-search`
+
+### Grouping: Repo+Commit vs Covmeta Hash
+
+Unlike BigQuery ingest (which groups by covmeta hash), Codecov upload groups
+by `(source_repo, commit_id)`. This means multiple binaries from the same repo
+(e.g., different packages compiled from the same source) merge into one upload.
+This gives Codecov a coherent per-repo coverage view and minimizes API calls.
+
+Hash groups with no resolved `source_repo` or `commit_id` are skipped with a
+warning — these are binaries whose source can't be traced (e.g., third-party
+CNI plugins).
+
+### Codecov CLI
+
+The `codecov` CLI binary is required. If not found on `PATH`, it is
+automatically downloaded from `cli.codecov.io` (Linux and macOS supported).
+Downloaded binaries are cleaned up after the run.
+
+### Path Rewriting for Codecov
+
+Coverage profiles contain Go package paths (e.g.,
+`github.com/openshift/apiserver/pkg/foo.go`). Codecov needs these to map to
+repo-relative paths. `rewriteCoverageForCodecov()` handles:
+
+- Standard module prefix stripping (`github.com/org/repo/` -> ``)
+- Container build paths (`/workspace/` prefix)
+- GOPATH mode paths (`/go/src/...`)
+- Workspace repos (`go.work`): each module prefix maps to its subdirectory
 
 ---
 
