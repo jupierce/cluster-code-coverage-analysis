@@ -24,6 +24,7 @@ var (
 	ccNamespaces []string
 	ccOwners     []string
 	ccDryRun     bool
+	ccSlug       string
 )
 
 var codecovUploadCmd = &cobra.Command{
@@ -61,6 +62,7 @@ func init() {
 	codecovUploadCmd.Flags().StringArrayVar(&ccNamespaces, "namespace", []string{"*"}, "Namespace glob patterns (repeatable, OR logic)")
 	codecovUploadCmd.Flags().StringArrayVar(&ccOwners, "owner", []string{"*"}, "Owner name glob patterns (repeatable, OR logic)")
 	codecovUploadCmd.Flags().BoolVar(&ccDryRun, "dry-run", false, "Show what would be uploaded without executing")
+	codecovUploadCmd.Flags().StringVar(&ccSlug, "slug", "", "Override repository slug for all uploads (e.g., owner/repo)")
 
 	clusterCmd.AddCommand(codecovUploadCmd)
 }
@@ -213,7 +215,10 @@ func runCodecovUpload(cmd *cobra.Command, args []string) error {
 	var uploaded, failed int
 
 	for i, rg := range repoGroups {
-		slug := extractRepoSlug(rg.Key.SourceRepo)
+		slug := ccSlug
+		if slug == "" {
+			slug = extractRepoSlug(rg.Key.SourceRepo)
+		}
 		gitService := extractGitService(rg.Key.SourceRepo)
 
 		// Count total owners and binaries
@@ -274,6 +279,7 @@ func runCodecovUpload(cmd *cobra.Command, args []string) error {
 			Slug:         slug,
 			GitService:   gitService,
 			Flags:        ccFlags,
+			RepoDir:      findClonedRepoDir(reposDir, rg.Key.SourceRepo, rg.Key.CommitID),
 		})
 		os.Remove(tmpFile.Name())
 
@@ -290,77 +296,104 @@ func runCodecovUpload(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// rewriteCoverageForCodecov attempts to strip the Go module prefix from
-// coverage file paths so Codecov maps them to repo-relative paths.
-// Falls back to the raw merged text if no repo is cloned or module is unknown.
+// rewriteCoverageForCodecov strips the Go module prefix from coverage file
+// paths so Codecov maps them to repo-relative paths.
+//
+// Derives the module path from the source_repo URL (e.g.,
+// "https://github.com/openshift/cluster-bootstrap" -> "github.com/openshift/cluster-bootstrap").
+// If cloned repos are available, also handles go.work workspaces and
+// build-path anomalies (/workspace/, /go/src/).
 func rewriteCoverageForCodecov(mergedText string, rg *repoCommitGroup, reposDir string, imageSources map[string]imageSource) string {
-	if reposDir == "" {
-		return mergedText
-	}
+	// Derive module path from source_repo URL — no cloned repo needed
+	moduleFromURL := modulePathFromSourceURL(rg.Key.SourceRepo)
 
-	// Try to find cloned repo for module name
-	var allOwners []*OwnerReport
-	for i := range rg.HashGroups {
-		allOwners = append(allOwners, rg.HashGroups[i].Owners...)
-	}
-
-	repoPath, moduleName, workspaceModules := resolveSourceRepo(allOwners, reposDir, imageSources, mergedText)
-	if repoPath == "" || moduleName == "" {
-		return mergedText
-	}
-
-	// Write to temp file, apply path rewriting, read back
-	tmpFile, err := os.CreateTemp("", "codecov-rewrite-*.out")
-	if err != nil {
-		return mergedText
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-	tmpFile.WriteString(mergedText)
-	tmpFile.Close()
-
-	covFileToUse := tmpPath
-
-	if workspaceModules != nil {
-		// Workspace repos: rewrite each module prefix to its workspace-relative path
-		// Each module in go.work maps to a subdirectory
-		rewritten := rewriteWorkspacePaths(mergedText, workspaceModules)
-		if rewritten != mergedText {
-			return rewritten
+	// If cloned repos exist, try workspace-aware rewriting first
+	if reposDir != "" {
+		var allOwners []*OwnerReport
+		for i := range rg.HashGroups {
+			allOwners = append(allOwners, rg.HashGroups[i].Owners...)
 		}
-	}
+		repoPath, moduleName, workspaceModules := resolveSourceRepo(allOwners, reposDir, imageSources, mergedText)
 
-	// Non-workspace: detect and rewrite common path patterns
-	packagePath := extractPackagePathFromCoverage(tmpPath)
-	needsRewrite := false
-	rewriteOldPath := packagePath
-
-	if moduleName != "" && packagePath != "" && !strings.HasPrefix(packagePath, moduleName) {
-		needsRewrite = true
-	}
-	if !needsRewrite && strings.Contains(mergedText, "/workspace/") && moduleName != "" {
-		needsRewrite = true
-		rewriteOldPath = "/workspace/"
-	}
-	if !needsRewrite && strings.Contains(mergedText, "/go/src/") {
-		needsRewrite = true
-		if moduleName != "" {
-			rewriteOldPath = "/go/src/" + moduleName
-		}
-	}
-
-	if needsRewrite {
-		rewrittenFile, err := rewriteCoveragePaths(covFileToUse, rewriteOldPath, moduleName)
-		if err == nil {
-			defer os.Remove(rewrittenFile)
-			data, err := os.ReadFile(rewrittenFile)
-			if err == nil {
-				return string(data)
+		if workspaceModules != nil {
+			rewritten := rewriteWorkspacePaths(mergedText, workspaceModules)
+			if rewritten != mergedText {
+				return rewritten
 			}
 		}
+
+		// Use cloned repo's actual module name if available (more accurate)
+		if repoPath != "" && moduleName != "" {
+			moduleFromURL = moduleName
+		}
 	}
 
-	return mergedText
+	if moduleFromURL == "" {
+		return mergedText
+	}
+
+	// Strip module prefix from all coverage lines
+	return stripModulePrefix(mergedText, moduleFromURL)
+}
+
+// findClonedRepoDir returns the cloned repo directory if it exists.
+// Mirrors the path layout used by clone_sources.go: repos/<host>/<org>/<repo>/<commit-prefix>/
+func findClonedRepoDir(reposDir, sourceURL, commitID string) string {
+	if reposDir == "" || sourceURL == "" {
+		return ""
+	}
+	src := imageSource{SourceRepo: sourceURL, CommitID: commitID}
+	dir := findRepoByImageSource(reposDir, src)
+	if dir != "" {
+		return dir
+	}
+	return ""
+}
+
+// modulePathFromSourceURL derives Go module path from a source repo URL.
+// "https://github.com/openshift/cluster-bootstrap" -> "github.com/openshift/cluster-bootstrap"
+// "git@github.com:org/repo.git" -> "github.com/org/repo"
+func modulePathFromSourceURL(sourceURL string) string {
+	// SSH URL: git@github.com:org/repo.git
+	if strings.Contains(sourceURL, "@") && strings.Contains(sourceURL, ":") && !strings.Contains(sourceURL, "://") {
+		parts := strings.SplitN(sourceURL, "@", 2)
+		if len(parts) == 2 {
+			hostAndPath := parts[1]
+			hostAndPath = strings.Replace(hostAndPath, ":", "/", 1)
+			hostAndPath = strings.TrimSuffix(hostAndPath, ".git")
+			return hostAndPath
+		}
+	}
+
+	u, err := url.Parse(sourceURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	path = strings.TrimSuffix(path, ".git")
+	return u.Host + "/" + path
+}
+
+// stripModulePrefix removes the Go module prefix from coverage file paths.
+// "github.com/openshift/cluster-bootstrap/cmd/foo.go:1.1,2.2 1 5"
+// becomes "cmd/foo.go:1.1,2.2 1 5"
+func stripModulePrefix(text, modulePrefix string) string {
+	prefix := modulePrefix + "/"
+	var result strings.Builder
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "mode:") || line == "" {
+			result.WriteString(line)
+			result.WriteByte('\n')
+			continue
+		}
+		if strings.HasPrefix(line, prefix) {
+			result.WriteString(strings.TrimPrefix(line, prefix))
+		} else {
+			result.WriteString(line)
+		}
+		result.WriteByte('\n')
+	}
+	return strings.TrimRight(result.String(), "\n") + "\n"
 }
 
 // rewriteWorkspacePaths rewrites module-prefixed paths in coverage text
@@ -413,14 +446,27 @@ func rewriteWorkspacePaths(text string, workspaceModules map[string]string) stri
 }
 
 // extractRepoSlug parses "owner/repo" from a source repository URL.
+// Handles HTTPS (https://github.com/org/repo) and SSH (git@github.com:org/repo.git).
 func extractRepoSlug(sourceURL string) string {
+	// Handle SSH URLs: git@github.com:org/repo.git
+	if strings.Contains(sourceURL, "@") && strings.Contains(sourceURL, ":") && !strings.Contains(sourceURL, "://") {
+		parts := strings.SplitN(sourceURL, ":", 2)
+		if len(parts) == 2 {
+			path := strings.TrimSuffix(parts[1], ".git")
+			slugParts := strings.SplitN(path, "/", 3)
+			if len(slugParts) >= 2 {
+				return slugParts[0] + "/" + slugParts[1]
+			}
+			return path
+		}
+	}
+
 	u, err := url.Parse(sourceURL)
 	if err != nil {
 		return sourceURL
 	}
 	path := strings.TrimPrefix(u.Path, "/")
 	path = strings.TrimSuffix(path, ".git")
-	// Return owner/repo (first two components)
 	parts := strings.SplitN(path, "/", 3)
 	if len(parts) >= 2 {
 		return parts[0] + "/" + parts[1]
@@ -429,12 +475,29 @@ func extractRepoSlug(sourceURL string) string {
 }
 
 // extractGitService determines the git hosting service from a source URL.
+// Handles HTTPS and SSH (git@host:...) URLs.
 func extractGitService(sourceURL string) string {
-	u, err := url.Parse(sourceURL)
-	if err != nil {
+	var host string
+
+	// Handle SSH URLs: git@github.com:org/repo.git
+	if strings.Contains(sourceURL, "@") && strings.Contains(sourceURL, ":") && !strings.Contains(sourceURL, "://") {
+		parts := strings.SplitN(sourceURL, "@", 2)
+		if len(parts) == 2 {
+			hostPart := strings.SplitN(parts[1], ":", 2)
+			host = strings.ToLower(hostPart[0])
+		}
+	} else {
+		u, err := url.Parse(sourceURL)
+		if err != nil {
+			return ""
+		}
+		host = strings.ToLower(u.Hostname())
+	}
+
+	if host == "" {
 		return ""
 	}
-	host := strings.ToLower(u.Hostname())
+
 	switch {
 	case strings.Contains(host, "github.com"):
 		return "github"
@@ -443,10 +506,6 @@ func extractGitService(sourceURL string) string {
 	case strings.Contains(host, "bitbucket"):
 		return "bitbucket"
 	default:
-		// Self-hosted or unknown — gitlab_enterprise is a common Codecov option
-		if strings.Contains(host, "gitlab") {
-			return "gitlab_enterprise"
-		}
 		return "github_enterprise"
 	}
 }
@@ -458,6 +517,7 @@ type codecovUploadOpts struct {
 	Slug         string
 	GitService   string
 	Flags        []string
+	RepoDir      string // working directory for codecov CLI (cloned repo root)
 }
 
 func execCodecovUpload(ctx context.Context, codecovPath string, opts codecovUploadOpts) error {
@@ -479,7 +539,21 @@ func execCodecovUpload(ctx context.Context, codecovPath string, opts codecovUplo
 		args = append(args, "--flag", flag)
 	}
 
+	// Log the command (mask token)
+	debugArgs := make([]string, len(args))
+	copy(debugArgs, args)
+	for i, a := range debugArgs {
+		if a == "-t" && i+1 < len(debugArgs) {
+			debugArgs[i+1] = "***"
+		}
+	}
+	fmt.Printf("  exec: %s %s\n", codecovPath, strings.Join(debugArgs, " "))
+
 	cmd := exec.CommandContext(ctx, codecovPath, args...)
+
+	if opts.RepoDir != "" {
+		cmd.Dir = opts.RepoDir
+	}
 
 	if ccURL != "" {
 		cmd.Env = append(os.Environ(), "CODECOV_URL="+ccURL)
