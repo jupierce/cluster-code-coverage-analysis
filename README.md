@@ -43,10 +43,11 @@ The primary workflow uses the `cluster` command group. Run these subcommands in
 order:
 
 ```
-coverage-collector cluster download      --collection <name>  # Download from S3
+coverage-collector cluster download       --collection <name>  # Download from S3
 coverage-collector cluster compile       --collection <name>  # Build SQLite DB
 coverage-collector cluster clone-sources --collection <name>  # Clone source repos
 coverage-collector cluster render        --collection <name>  # Generate HTML
+coverage-collector cluster codecov-upload --collection <name>  # Upload to Codecov
 ```
 
 ### 1. `cluster download`
@@ -250,6 +251,47 @@ The tool uses a 3-strategy cascade to find source code for annotated reports:
 For host binaries (no container image), source info comes from `info.json` files
 using synthetic `host:<binary_name>` keys.
 
+## Codecov Upload
+
+Upload merged coverage data to Codecov for integration with DevLake and PR
+coverage feedback. Groups coverage by source repository and commit, merging all
+binaries from the same repo into a single upload.
+
+```bash
+# Upload all coverage with default flag (openshift-e2e)
+coverage-collector cluster codecov-upload --collection my-collection \
+    --codecov-token $CODECOV_TOKEN
+
+# Upload to a self-hosted Codecov instance
+coverage-collector cluster codecov-upload --collection my-collection \
+    --codecov-token $CODECOV_TOKEN \
+    --codecov-url https://codecov.internal.example.com
+
+# Filter to specific namespaces
+coverage-collector cluster codecov-upload --collection my-collection \
+    --codecov-token $CODECOV_TOKEN \
+    --namespace 'openshift-apiserver' --namespace 'openshift-etcd'
+
+# Dry run — see what would be uploaded
+coverage-collector cluster codecov-upload --collection my-collection \
+    --codecov-token $CODECOV_TOKEN --dry-run
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--codecov-token` | | Codecov upload token (or set `CODECOV_TOKEN` env). Org-level tokens work for all repos |
+| `--flag` | `openshift-e2e` | Codecov flags (repeatable). Used to distinguish E2E from unit test coverage |
+| `--codecov-url` | | Self-hosted Codecov instance URL |
+| `--namespace` | `*` | Namespace glob filter (repeatable, OR logic) |
+| `--owner` | `*` | Owner name glob filter (repeatable, OR logic) |
+| `--source-org` | `*` | Source repo org glob filter (repeatable, OR logic). Filters by org in slug (e.g., `openshift`) |
+| `--dry-run` | false | Show what would be uploaded without executing |
+
+The `codecov` CLI binary is required. If not found on `PATH`, it is
+automatically downloaded from `cli.codecov.io`.
+
 ## BigQuery Ingest
 
 The `bigquery` command group persists coverage data from the SQLite database
@@ -324,6 +366,9 @@ variable.
 
 6. **GCP credentials** *(for BigQuery ingest)*: `gcloud auth application-default
    login` or `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+
+7. **Codecov token** *(for codecov-upload)*: Organization-level upload token from
+   Codecov settings. Set via `--codecov-token` or `CODECOV_TOKEN` env variable.
 
 ## Acknowledgments
 
