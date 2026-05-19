@@ -413,6 +413,9 @@ coverage-collector cluster codecov-upload --collection <name> \
 - `--codecov-url`: Self-hosted Codecov instance URL (sets `CODECOV_URL` env
   for the CLI process).
 - `--namespace` / `--owner`: Glob filters (same OR/AND logic as BigQuery ingest).
+- `--source-org`: Source repo org glob filter (repeatable, OR logic). Filters
+  by the org component of the repo slug (e.g., `openshift`, `operator-framework`).
+  Enables multi-org CI with separate tokens per org.
 - `--dry-run`: Show what would be uploaded without executing.
 
 ### Upload Flow

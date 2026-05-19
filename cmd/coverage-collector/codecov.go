@@ -25,6 +25,7 @@ var (
 	ccOwners     []string
 	ccDryRun     bool
 	ccSlug       string
+	ccSourceOrgs []string
 )
 
 var codecovUploadCmd = &cobra.Command{
@@ -63,6 +64,7 @@ func init() {
 	codecovUploadCmd.Flags().StringArrayVar(&ccOwners, "owner", []string{"*"}, "Owner name glob patterns (repeatable, OR logic)")
 	codecovUploadCmd.Flags().BoolVar(&ccDryRun, "dry-run", false, "Show what would be uploaded without executing")
 	codecovUploadCmd.Flags().StringVar(&ccSlug, "slug", "", "Override repository slug for all uploads (e.g., owner/repo)")
+	codecovUploadCmd.Flags().StringArrayVar(&ccSourceOrgs, "source-org", []string{"*"}, "Source repo org glob patterns (repeatable, OR logic)")
 
 	clusterCmd.AddCommand(codecovUploadCmd)
 }
@@ -214,11 +216,21 @@ func runCodecovUpload(cmd *cobra.Command, args []string) error {
 	reposDir := filepath.Join(collectionName, "repos")
 	var uploaded, failed int
 
+	var skippedOrg int
+
 	for i, rg := range repoGroups {
 		slug := ccSlug
 		if slug == "" {
 			slug = extractRepoSlug(rg.Key.SourceRepo)
 		}
+
+		// Filter by source org
+		orgName := extractOrgFromSlug(slug)
+		if !matchesAnyGlob(orgName, ccSourceOrgs) {
+			skippedOrg++
+			continue
+		}
+
 		gitService := extractGitService(rg.Key.SourceRepo)
 
 		// Count total owners and binaries
@@ -292,6 +304,9 @@ func runCodecovUpload(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if skippedOrg > 0 {
+		fmt.Printf("Skipped %d repo groups not matching --source-org %v\n", skippedOrg, ccSourceOrgs)
+	}
 	fmt.Printf("\nCodecov upload complete: %d uploaded, %d failed\n", uploaded, failed)
 	return nil
 }
@@ -472,6 +487,12 @@ func extractRepoSlug(sourceURL string) string {
 		return parts[0] + "/" + parts[1]
 	}
 	return path
+}
+
+// extractOrgFromSlug returns the org portion of an "org/repo" slug.
+func extractOrgFromSlug(slug string) string {
+	parts := strings.SplitN(slug, "/", 2)
+	return parts[0]
 }
 
 // extractGitService determines the git hosting service from a source URL.

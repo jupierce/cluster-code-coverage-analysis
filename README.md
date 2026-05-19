@@ -286,6 +286,7 @@ coverage-collector cluster codecov-upload --collection my-collection \
 | `--codecov-url` | | Self-hosted Codecov instance URL |
 | `--namespace` | `*` | Namespace glob filter (repeatable, OR logic) |
 | `--owner` | `*` | Owner name glob filter (repeatable, OR logic) |
+| `--source-org` | `*` | Source repo org glob filter (repeatable, OR logic). Filters by org in slug (e.g., `openshift`) |
 | `--dry-run` | false | Show what would be uploaded without executing |
 
 The `codecov` CLI binary is required. If not found on `PATH`, it is
